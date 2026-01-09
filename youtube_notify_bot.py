@@ -1,37 +1,64 @@
 import os
 import sys
-
 import json
 import logging
+import asyncio
 import feedparser
+
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
-
-# Настройки логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
-# Подавляем подробные логи APScheduler до уровня WARNING
+
+LOG_FILE = 'bot.log'
+STATE_FILE = 'state.json'
+ANTISPAM_DELAY = 120
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
 logging.getLogger('apscheduler.scheduler').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
 load_dotenv()
-TELEGRAM_TOKEN     = os.getenv('TELEGRAM_TOKEN')
-TG_CHANNEL_ID      = os.getenv('TG_CHANNEL_ID')
-YOUTUBE_CHANNEL_ID = os.getenv('YOUTUBE_CHANNEL_ID')
-STATE_FILE         = 'state.json'
 
-# Проверка обязательных переменных окружения
-for var in ('TELEGRAM_TOKEN', 'TG_CHANNEL_ID', 'YOUTUBE_CHANNEL_ID'):
-    if not globals().get(var):
-        logger.error(f"❌ {var} не задан в .env!")
-        sys.exit(1)
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 
-# Работа с файлом состояния
+YOUTUBE_CHANNEL_IDS = [
+    cid.strip()
+    for cid in os.getenv('YOUTUBE_CHANNEL_IDS', '').split(',')
+    if cid.strip()
+]
+
+TG_CHANNELS = {
+    pair.split(':')[0]: pair.split(':')[1]
+    for pair in os.getenv('TG_CHANNELS', '').split(',')
+    if ':' in pair
+}
+
+if not TELEGRAM_TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN не задан")
+    sys.exit(1)
+
+if not YOUTUBE_CHANNEL_IDS:
+    logger.error("❌ YOUTUBE_CHANNEL_IDS не задан")
+    sys.exit(1)
+
+if not TG_CHANNELS:
+    logger.error("❌ TG_CHANNELS не задан")
+    sys.exit(1)
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
@@ -43,77 +70,105 @@ def save_state(state):
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-# Получение RSS-фида канала
-def fetch_feed():
-    url = f'https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}'
+
+def fetch_feed(channel_id: str):
+    url = f'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}'
     return feedparser.parse(url)
 
-# Проверка новых видео
+
 async def check_updates(context: ContextTypes.DEFAULT_TYPE):
-    feed = fetch_feed()
     state = load_state()
 
-    if not feed.entries:
-        logger.warning("RSS-фид пуст или недоступен")
-        return
+    for channel_id in YOUTUBE_CHANNEL_IDS:
+        feed = fetch_feed(channel_id)
+        if not feed.entries:
+            continue
 
-    entry = feed.entries[0]
-    vid = entry.yt_videoid
-    title = entry.title
-    link = entry.link
-    thumb = None
-    if 'media_thumbnail' in entry and entry.media_thumbnail:
-        thumb = entry.media_thumbnail[0]['url']
-    description = entry.summary
+        # Самое новое видео в RSS (YouTube всегда кладёт его первым)
+        latest = feed.entries[0]
+        latest_video_id = latest.yt_videoid
 
-    if vid != state.get('last_video'):
-        caption = (
-            f"📹 <b>Новое видео:</b> {title}\n"
-            f"<i>{description}</i>\n"
-            f"🔗 <a href=\"{link}\">Смотреть на YouTube</a>"
+        # 🔹 Первый запуск — ничего не отправляем, только запоминаем
+        if channel_id not in state:
+            state[channel_id] = latest_video_id
+            save_state(state)
+            logger.info(
+                f"Первый запуск для канала {channel_id}. "
+                f"Видео зафиксировано, без отправки."
+            )
+            continue
+
+        # 🔹 Если нового видео нет — выходим
+        if state.get(channel_id) == latest_video_id:
+            continue
+
+        title = latest.title
+        link = latest.link
+
+        # 🔹 Shorts пропускаем, но состояние обновляем
+        if '#shorts' in title.lower():
+            logger.info(f"Пропущен Shorts: {title}")
+            state[channel_id] = latest_video_id
+            save_state(state)
+            continue
+
+        tg_channel = TG_CHANNELS.get(
+            channel_id,
+            list(TG_CHANNELS.values())[0]
         )
-        btn = InlineKeyboardButton("🚀 Смотреть", url=link)
-        markup = InlineKeyboardMarkup([[btn]])
+
+        caption = (
+            f"🚀 <b>Новое видео</b>\n\n"
+            f"🎬 <b>{title}</b>\n\n"
+            f"👉 <a href=\"{link}\">Смотреть на YouTube</a>"
+        )
+
+        thumb = None
+        if hasattr(latest, 'media_thumbnail') and latest.media_thumbnail:
+            thumb = latest.media_thumbnail[0]['url']
+
+        await asyncio.sleep(ANTISPAM_DELAY)
 
         if thumb:
             await context.bot.send_photo(
-                chat_id=TG_CHANNEL_ID,
+                chat_id=tg_channel,
                 photo=thumb,
                 caption=caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup
+                parse_mode=ParseMode.HTML
             )
         else:
             await context.bot.send_message(
-                chat_id=TG_CHANNEL_ID,
+                chat_id=tg_channel,
                 text=caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup
+                parse_mode=ParseMode.HTML
             )
 
-        state['last_video'] = vid
+        # 🔹 Обновляем состояние ТОЛЬКО после успешной отправки
+        state[channel_id] = latest_video_id
         save_state(state)
 
-# Обработчик команды /start
+        logger.info(f"Отправлено новое видео: {title}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Бот запущен и отслеживает новые видео через RSS-ленту YouTube-канала."
+        "🤖 Бот запущен и отслеживает YouTube‑каналы."
     )
 
-# Точка входа
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Инициализация JobQueue
-    jq = app.job_queue or JobQueue()
-    jq.set_application(app)
-    jq.run_repeating(check_updates, interval=1800, first=10)
+    # Планировщик задач (JobQueue) уже инициализирован внутри Application
+    app.job_queue.run_repeating(
+        check_updates,
+        interval=1800,
+        first=10
+    )
 
     app.add_handler(CommandHandler('start', start))
 
     logger.info("Бот успешно запущен")
     app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
