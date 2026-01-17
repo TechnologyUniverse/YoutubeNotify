@@ -105,9 +105,26 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
         title = latest.title
         link = latest.link
 
-        # 🔹 Shorts пропускаем, но состояние обновляем
-        if '#shorts' in title.lower():
-            logger.info(f"Пропущен Shorts: {title}")
+        # 🔹 ГИБРИДНЫЙ фильтр Shorts
+        title_lower = title.lower()
+        link_lower = link.lower()
+
+        is_short = False
+        reasons = []
+
+        if '#shorts' in title_lower:
+            is_short = True
+            reasons.append('#shorts in title')
+
+        if '/shorts/' in link_lower:
+            is_short = True
+            reasons.append('/shorts/ in link')
+
+        if is_short:
+            logger.warning(
+                f"possible_short | канал={channel_id} | видео={latest_video_id} | "
+                f"причины={', '.join(reasons)} | {title}"
+            )
             state[channel_id] = latest_video_id
             save_state(state)
             continue
