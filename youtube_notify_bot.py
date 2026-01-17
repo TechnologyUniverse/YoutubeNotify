@@ -46,6 +46,11 @@ TG_CHANNELS = {
     if ':' in pair
 }
 
+CHANNEL_NAMES = {
+    "UC2qbVIfOigWXrUoQjQjaRVw": "Technology Universe",
+    "UCK-x6Di4CT74zDD1JBo5vsA": "Technology Universe Podcast"
+}
+
 if not TELEGRAM_TOKEN:
     logger.error("❌ TELEGRAM_TOKEN не задан")
     sys.exit(1)
@@ -105,6 +110,23 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
         title = latest.title
         link = latest.link
 
+        channel_name = CHANNEL_NAMES.get(channel_id, "YouTube")
+
+        title_lower = title.lower()
+
+        is_live = False
+        live_key = f"live_{latest_video_id}"
+
+        if ('live' in title_lower or 'стрим' in title_lower) and state.get(live_key) != latest_video_id:
+            is_live = True
+            state[live_key] = latest_video_id
+            save_state(state)
+
+        is_premiere = False
+
+        if 'премьера' in title_lower or 'premiere' in title_lower:
+            is_premiere = True
+
         # 🔹 ГИБРИДНЫЙ фильтр Shorts
         title_lower = title.lower()
         link_lower = link.lower()
@@ -134,11 +156,30 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             list(TG_CHANNELS.values())[0]
         )
 
-        caption = (
-            f"🚀 <b>Новое видео</b>\n\n"
-            f"🎬 <b>{title}</b>\n\n"
-            f"👉 <a href=\"{link}\">Смотреть на YouTube</a>"
-        )
+        if is_live:
+            caption = (
+                f"🔴 <b>Начался стрим</b>\n\n"
+                f"📺 <b>{title}</b>\n"
+                f"🏷 <i>{channel_name}</i>\n\n"
+                f"👉 <a href=\"{link}\">Смотреть стрим</a>\n\n"
+                f"#live #стрим #youtube"
+            )
+        elif is_premiere:
+            caption = (
+                f"⏰ <b>Премьера</b>\n\n"
+                f"🎬 <b>{title}</b>\n"
+                f"🏷 <i>{channel_name}</i>\n\n"
+                f"👉 <a href=\"{link}\">Перейти к премьере</a>\n\n"
+                f"#premiere #youtube"
+            )
+        else:
+            caption = (
+                f"🚀 <b>Новое видео</b>\n\n"
+                f"🎬 <b>{title}</b>\n"
+                f"🏷 <i>{channel_name}</i>\n\n"
+                f"👉 <a href=\"{link}\">Смотреть на YouTube</a>\n\n"
+                f"#youtube #video"
+            )
 
         thumb = None
         if hasattr(latest, 'media_thumbnail') and latest.media_thumbnail:
@@ -172,6 +213,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Бот запущен и отслеживает YouTube‑каналы."
     )
 
+async def checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔄 Ручная проверка запущена")
+    await check_updates(context)
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -183,6 +228,7 @@ def main():
     )
 
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('checknow', checknow))
 
     logger.info("Бот успешно запущен")
     app.run_polling()
