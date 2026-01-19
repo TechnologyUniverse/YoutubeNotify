@@ -18,6 +18,12 @@ LOG_FILE = 'bot.log'
 STATE_FILE = 'state.json'
 ANTISPAM_DELAY = 120
 
+def make_live_key(channel_id: str, title: str, scheduled_time: str | None):
+    base = f"{channel_id}|{title.strip().lower()}"
+    if scheduled_time:
+        base += f"|{scheduled_time}"
+    return base
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -83,6 +89,8 @@ def fetch_feed(channel_id: str):
 
 async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
+    state.setdefault("live_streams", {})
+    state.setdefault("videos", {})
 
     for channel_id in YOUTUBE_CHANNEL_IDS:
         feed = fetch_feed(channel_id)
@@ -92,14 +100,14 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
         for latest in feed.entries:
             latest_video_id = latest.yt_videoid
 
-            video_state = state.get(latest_video_id, {
+            video_state = state["videos"].get(latest_video_id, {
                 "scheduled_notified": False,
                 "live_notified": False,
                 "finished": False
             })
 
-            if not state:
-                state[latest_video_id] = video_state
+            if not state["videos"] and not state["live_streams"]:
+                state["videos"][latest_video_id] = video_state
                 save_state(state)
                 logger.info("Первый запуск. Видео зафиксировано без отправки.")
                 continue
@@ -124,6 +132,12 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     ).astimezone().strftime("%d.%m.%Y %H:%M")
                 except Exception:
                     scheduled_time = None
+
+            live_key = make_live_key(channel_id, title, scheduled_time)
+            live_state = state["live_streams"].get(live_key, {
+                "scheduled_notified": False,
+                "live_notified": False
+            })
 
             is_scheduled_live = False
             is_live = False
@@ -170,7 +184,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 list(TG_CHANNELS.values())[0]
             )
 
-            if is_scheduled_live and not video_state["scheduled_notified"]:
+            if is_scheduled_live and not live_state["scheduled_notified"]:
                 time_block = (
                     f"🗓 <b>Дата и время:</b> {scheduled_time}\n\n"
                     if scheduled_time else ""
@@ -184,9 +198,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     f"👉 <a href=\"{link}\">Перейти к стриму</a>\n\n"
                     f"#live #youtube"
                 )
-                video_state["scheduled_notified"] = True
+                live_state["scheduled_notified"] = True
+                state["live_streams"][live_key] = live_state
 
-            elif is_live and not video_state["live_notified"]:
+            elif is_live and not live_state["live_notified"]:
                 caption = (
                     f"🔴 <b>Начался стрим</b>\n\n"
                     f"📺 <b>{title}</b>\n"
@@ -194,7 +209,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     f"👉 <a href=\"{link}\">Смотреть стрим</a>\n\n"
                     f"#live #стрим #youtube"
                 )
-                video_state["live_notified"] = True
+                live_state["live_notified"] = True
+                state["live_streams"][live_key] = live_state
 
             else:
                 continue
@@ -219,12 +235,12 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML
                 )
 
-            state[latest_video_id] = video_state
+            state["videos"][latest_video_id] = video_state
             save_state(state)
 
             logger.info(
                 f"Отправлено уведомление: "
-                f"{'LIVE' if is_live else 'SCHEDULED'} | {title}"
+                f"{'LIVE' if is_live else 'SCHEDULED'} | {title} | key={live_key}"
             )
             break
 
