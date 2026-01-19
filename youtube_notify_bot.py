@@ -18,11 +18,10 @@ LOG_FILE = 'bot.log'
 STATE_FILE = 'state.json'
 ANTISPAM_DELAY = 120
 
-def make_live_key(channel_id: str, title: str, scheduled_time: str | None):
-    base = f"{channel_id}|{title.strip().lower()}"
-    if scheduled_time:
-        base += f"|{scheduled_time}"
-    return base
+# VERSION: 1.0.6
+
+def make_live_key(channel_id: str, video_id: str):
+    return f"{channel_id}|{video_id}"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,14 +105,23 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 "finished": False
             })
 
+            live_key = make_live_key(channel_id, latest_video_id)
+
             if not state["videos"] and not state["live_streams"]:
                 state["videos"][latest_video_id] = video_state
+                state["live_streams"][live_key] = {
+                    "scheduled_notified": False,
+                    "live_notified": False
+                }
                 save_state(state)
-                logger.info("Первый запуск. Видео зафиксировано без отправки.")
+                logger.info("Первый запуск: состояние инициализировано, без отправки")
                 continue
 
             title = latest.title
             link = latest.link
+
+            if live_key not in state["live_streams"]:
+                logger.info(f"Обнаружен новый стрим | {title} | key={live_key}")
 
             channel_name = CHANNEL_NAMES.get(channel_id, "YouTube")
 
@@ -133,7 +141,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     scheduled_time = None
 
-            live_key = make_live_key(channel_id, title, scheduled_time)
             live_state = state["live_streams"].get(live_key, {
                 "scheduled_notified": False,
                 "live_notified": False
@@ -175,7 +182,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     f"possible_short | канал={channel_id} | видео={latest_video_id} | "
                     f"причины={', '.join(reasons)} | {title}"
                 )
-                state[latest_video_id] = video_state
+                state["videos"][latest_video_id] = video_state
                 save_state(state)
                 continue
 
@@ -185,6 +192,11 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             )
 
             if is_scheduled_live and not live_state["scheduled_notified"]:
+                # Если стрим уже был зафиксирован ранее — не слать повторно
+                if live_key in state["live_streams"] and state["live_streams"][live_key].get("scheduled_notified"):
+                    logger.debug(f"Scheduled уже отправлен ранее | {title}")
+                    continue
+
                 time_block = (
                     f"🗓 <b>Дата и время:</b> {scheduled_time}\n\n"
                     if scheduled_time else ""
@@ -212,7 +224,24 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 live_state["live_notified"] = True
                 state["live_streams"][live_key] = live_state
 
+            elif not is_scheduled_live and not is_live and not is_premiere:
+                if video_state.get("published"):
+                    continue
+
+                caption = (
+                    f"🚀 <b>Новое видео</b>\n\n"
+                    f"📺 <b>{title}</b>\n"
+                    f"🏷 <i>{channel_name}</i>\n\n"
+                    f"👉 <a href=\"{link}\">Смотреть видео</a>\n\n"
+                    f"#video #youtube"
+                )
+
+                video_state["published"] = True
+
             else:
+                logger.debug(
+                    f"Пропуск: уже обработан | {title} | key={live_key}"
+                )
                 continue
 
             thumb = None
@@ -240,9 +269,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
             logger.info(
                 f"Отправлено уведомление: "
-                f"{'LIVE' if is_live else 'SCHEDULED'} | {title} | key={live_key}"
+                f"{'LIVE' if is_live else 'SCHEDULED' if is_scheduled_live else 'VIDEO'} | {title} | key={live_key}"
             )
-            break
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
