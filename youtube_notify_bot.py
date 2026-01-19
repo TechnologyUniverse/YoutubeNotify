@@ -89,22 +89,19 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
         if not feed.entries:
             continue
 
-        # Самое новое видео в RSS (YouTube всегда кладёт его первым)
         latest = feed.entries[0]
         latest_video_id = latest.yt_videoid
 
-        # 🔹 Первый запуск — ничего не отправляем, только запоминаем
-        if channel_id not in state:
-            state[channel_id] = latest_video_id
-            save_state(state)
-            logger.info(
-                f"Первый запуск для канала {channel_id}. "
-                f"Видео зафиксировано, без отправки."
-            )
-            continue
+        video_state = state.get(latest_video_id, {
+            "scheduled_notified": False,
+            "live_notified": False,
+            "finished": False
+        })
 
-        # 🔹 Если нового видео нет — выходим
-        if state.get(channel_id) == latest_video_id:
+        if not state:
+            state[latest_video_id] = video_state
+            save_state(state)
+            logger.info("Первый запуск. Видео зафиксировано без отправки.")
             continue
 
         title = latest.title
@@ -114,13 +111,11 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
         title_lower = title.lower()
 
-        is_live = False
-        live_key = f"live_{latest_video_id}"
+        broadcast = getattr(latest, "yt_livebroadcastcontent", "")
+        broadcast = broadcast.lower()
 
-        if ('live' in title_lower or 'стрим' in title_lower) and state.get(live_key) != latest_video_id:
-            is_live = True
-            state[live_key] = latest_video_id
-            save_state(state)
+        is_scheduled_live = broadcast == "upcoming"
+        is_live = broadcast == "live"
 
         is_premiere = False
 
@@ -147,7 +142,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 f"possible_short | канал={channel_id} | видео={latest_video_id} | "
                 f"причины={', '.join(reasons)} | {title}"
             )
-            state[channel_id] = latest_video_id
+            state[latest_video_id] = video_state
             save_state(state)
             continue
 
@@ -156,7 +151,17 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             list(TG_CHANNELS.values())[0]
         )
 
-        if is_live:
+        if is_scheduled_live and not video_state["scheduled_notified"]:
+            caption = (
+                f"⏰ <b>Запланирован стрим</b>\n\n"
+                f"📺 <b>{title}</b>\n"
+                f"🏷 <i>{channel_name}</i>\n\n"
+                f"👉 <a href=\"{link}\">Перейти к стриму</a>\n\n"
+                f"#live #youtube"
+            )
+            video_state["scheduled_notified"] = True
+
+        elif is_live and not video_state["live_notified"]:
             caption = (
                 f"🔴 <b>Начался стрим</b>\n\n"
                 f"📺 <b>{title}</b>\n"
@@ -164,22 +169,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 f"👉 <a href=\"{link}\">Смотреть стрим</a>\n\n"
                 f"#live #стрим #youtube"
             )
-        elif is_premiere:
-            caption = (
-                f"⏰ <b>Премьера</b>\n\n"
-                f"🎬 <b>{title}</b>\n"
-                f"🏷 <i>{channel_name}</i>\n\n"
-                f"👉 <a href=\"{link}\">Перейти к премьере</a>\n\n"
-                f"#premiere #youtube"
-            )
+            video_state["live_notified"] = True
+
         else:
-            caption = (
-                f"🚀 <b>Новое видео</b>\n\n"
-                f"🎬 <b>{title}</b>\n"
-                f"🏷 <i>{channel_name}</i>\n\n"
-                f"👉 <a href=\"{link}\">Смотреть на YouTube</a>\n\n"
-                f"#youtube #video"
-            )
+            continue
 
         thumb = None
         if hasattr(latest, 'media_thumbnail') and latest.media_thumbnail:
@@ -201,11 +194,13 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
-        # 🔹 Обновляем состояние ТОЛЬКО после успешной отправки
-        state[channel_id] = latest_video_id
+        state[latest_video_id] = video_state
         save_state(state)
 
-        logger.info(f"Отправлено новое видео: {title}")
+        logger.info(
+            f"Отправлено уведомление: "
+            f"{'LIVE' if is_live else 'SCHEDULED'} | {title}"
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
