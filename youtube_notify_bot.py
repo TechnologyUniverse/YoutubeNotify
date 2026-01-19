@@ -18,7 +18,7 @@ LOG_FILE = 'bot.log'
 STATE_FILE = 'state.json'
 ANTISPAM_DELAY = 120
 
-# VERSION: 1.0.6
+# VERSION: 1.0.7
 
 def make_live_key(channel_id: str, video_id: str):
     return f"{channel_id}|{video_id}"
@@ -90,13 +90,26 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     state.setdefault("live_streams", {})
     state.setdefault("videos", {})
+    state.setdefault("last_seen_timestamp", {})
 
     for channel_id in YOUTUBE_CHANNEL_IDS:
+        last_seen = state["last_seen_timestamp"].get(channel_id, 0)
+
         feed = fetch_feed(channel_id)
         if not feed.entries:
             continue
 
         for latest in feed.entries:
+            title = latest.title
+            link = latest.link
+
+            published_ts = 0
+            if hasattr(latest, "published_parsed") and latest.published_parsed:
+                published_ts = int(asyncio.get_event_loop().time()) if False else int(__import__("time").mktime(latest.published_parsed))
+
+            if published_ts <= last_seen:
+                continue
+
             latest_video_id = latest.yt_videoid
 
             video_state = state["videos"].get(latest_video_id, {
@@ -117,11 +130,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 logger.info("Первый запуск: состояние инициализировано, без отправки")
                 continue
 
-            title = latest.title
-            link = latest.link
-
-            if live_key not in state["live_streams"]:
-                logger.info(f"Обнаружен новый стрим | {title} | key={live_key}")
 
             channel_name = CHANNEL_NAMES.get(channel_id, "YouTube")
 
@@ -212,6 +220,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 )
                 live_state["scheduled_notified"] = True
                 state["live_streams"][live_key] = live_state
+                state["last_seen_timestamp"][channel_id] = max(
+                    state["last_seen_timestamp"].get(channel_id, 0),
+                    published_ts
+                )
 
             elif is_live and not live_state["live_notified"]:
                 caption = (
@@ -223,6 +235,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 )
                 live_state["live_notified"] = True
                 state["live_streams"][live_key] = live_state
+                state["last_seen_timestamp"][channel_id] = max(
+                    state["last_seen_timestamp"].get(channel_id, 0),
+                    published_ts
+                )
 
             elif not is_scheduled_live and not is_live and not is_premiere:
                 if video_state.get("published"):
@@ -237,6 +253,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 video_state["published"] = True
+                state["last_seen_timestamp"][channel_id] = max(
+                    state["last_seen_timestamp"].get(channel_id, 0),
+                    published_ts
+                )
 
             else:
                 logger.debug(
