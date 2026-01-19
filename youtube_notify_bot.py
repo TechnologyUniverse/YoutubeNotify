@@ -114,6 +114,17 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             broadcast = getattr(latest, "yt_livebroadcastcontent", "")
             broadcast = broadcast.lower()
 
+            scheduled_time = None
+            if hasattr(latest, "yt_scheduledstarttime"):
+                try:
+                    from datetime import datetime, timezone
+                    scheduled_time = datetime.fromtimestamp(
+                        int(latest.yt_scheduledstarttime),
+                        tz=timezone.utc
+                    ).astimezone().strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    scheduled_time = None
+
             is_scheduled_live = False
             is_live = False
 
@@ -160,10 +171,16 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             )
 
             if is_scheduled_live and not video_state["scheduled_notified"]:
+                time_block = (
+                    f"🗓 <b>Дата и время:</b> {scheduled_time}\n\n"
+                    if scheduled_time else ""
+                )
+
                 caption = (
                     f"⏰ <b>Запланирован стрим</b>\n\n"
                     f"📺 <b>{title}</b>\n"
                     f"🏷 <i>{channel_name}</i>\n\n"
+                    f"{time_block}"
                     f"👉 <a href=\"{link}\">Перейти к стриму</a>\n\n"
                     f"#live #youtube"
                 )
