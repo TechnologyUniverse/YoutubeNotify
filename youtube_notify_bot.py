@@ -4,6 +4,8 @@ import json
 import logging
 import asyncio
 import feedparser
+import time
+from calendar import timegm
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,13 +16,19 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from typing import Any, Dict, cast
+import time as _time
+from datetime import datetime, timezone
+
+VERSION = "1.1.17"
+# Stable / Production
+
 LOG_FILE = 'bot.log'
 STATE_FILE = 'state.json'
 ANTISPAM_DELAY = 120
+EVENT_TTL = 6 * 60 * 60  # 6 часов
 
-# VERSION: 1.0.8
-
-def make_live_key(channel_id: str, video_id: str):
+def make_live_key(channel_id: str, video_id: str) -> str:
     return f"{channel_id}|{video_id}"
 
 logging.basicConfig(
@@ -91,15 +99,11 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     state.setdefault("live_streams", {})
     state.setdefault("videos", {})
     state.setdefault("last_seen_timestamp", {})
-    state.setdefault("processing_lock", False)
     state.setdefault("initialized", False)
+    state.setdefault("sent_events", {})
 
-    if state["processing_lock"]:
-        logger.warning("check_updates уже выполняется — пропуск")
-        return
+    now_ts = int(time.time())
 
-    state["processing_lock"] = True
-    save_state(state)
     try:
 
         for channel_id in YOUTUBE_CHANNEL_IDS:
@@ -111,29 +115,34 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
             if not state["initialized"]:
                 newest_ts = 0
-                for entry in feed.entries:
-                    if hasattr(entry, "published_parsed") and entry.published_parsed:
-                        ts = int(__import__("time").mktime(entry.published_parsed))
+                for entry_raw in feed.entries:
+                    entry: Dict[str, Any] = entry_raw
+                    published_parsed = entry.get("published_parsed")
+                    if published_parsed:
+                        ts = int(timegm(cast(_time.struct_time, published_parsed)))
                         newest_ts = max(newest_ts, ts)
                 state["last_seen_timestamp"][channel_id] = newest_ts
                 continue
 
-            for latest in feed.entries:
-                title = latest.title
-                link = latest.link
+            for entry_raw in feed.entries:
+                entry: Dict[str, Any] = entry_raw
+                title = entry.get("title", "")
+                link = entry.get("link", "")
 
-                published_ts = 0
-                if hasattr(latest, "published_parsed") and latest.published_parsed:
-                    published_ts = int(asyncio.get_event_loop().time()) if False else int(__import__("time").mktime(latest.published_parsed))
+                published_parsed = entry.get("published_parsed")
+                if published_parsed:
+                    published_ts = int(timegm(cast(_time.struct_time, published_parsed)))
+                else:
+                    published_ts = 0
 
-                if published_ts <= last_seen:
+                if published_ts <= state["last_seen_timestamp"].get(channel_id, 0):
                     continue
 
-                latest_video_id = latest.yt_videoid
-
-                if latest_video_id in state["videos"]:
-                    logger.debug(f"Видео уже обработано | {latest_video_id}")
+                latest_video_id_raw = entry.get("yt_videoid")
+                if not isinstance(latest_video_id_raw, str):
                     continue
+
+                latest_video_id = latest_video_id_raw
 
                 video_state = state["videos"].get(latest_video_id, {
                     "scheduled_notified": False,
@@ -144,19 +153,16 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
                 channel_name = CHANNEL_NAMES.get(channel_id, "YouTube")
 
-                title_lower = title.lower()
+                title_lower = title.lower() if isinstance(title, str) else ""
 
-                broadcast = getattr(latest, "yt_livebroadcastcontent", "")
-                broadcast = broadcast.lower()
+                broadcast = entry.get("yt_livebroadcastcontent", "")
+                broadcast = broadcast.lower() if isinstance(broadcast, str) else ""
 
                 scheduled_time = None
-                if hasattr(latest, "yt_scheduledstarttime"):
+                raw_ts = entry.get("yt_scheduledstarttime")
+                if raw_ts:
                     try:
-                        from datetime import datetime, timezone
-                        scheduled_time = datetime.fromtimestamp(
-                            int(latest.yt_scheduledstarttime),
-                            tz=timezone.utc
-                        ).astimezone().strftime("%d.%m.%Y %H:%M")
+                        scheduled_time = datetime.fromtimestamp(int(cast(str, raw_ts)), tz=timezone.utc).astimezone().strftime("%d.%m.%Y %H:%M")
                     except Exception:
                         scheduled_time = None
 
@@ -182,8 +188,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     is_premiere = True
 
                 # 🔹 ГИБРИДНЫЙ фильтр Shorts
-                title_lower = title.lower()
-                link_lower = link.lower()
+
+                link_lower = link.lower() if isinstance(link, str) else ""
 
                 is_short = False
                 reasons = []
@@ -201,11 +207,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         f"possible_short | канал={channel_id} | видео={latest_video_id} | "
                         f"причины={', '.join(reasons)} | {title}"
                     )
-                    state["last_seen_timestamp"][channel_id] = max(
-                        state["last_seen_timestamp"].get(channel_id, 0),
-                        published_ts
-                    )
-                    save_state(state)
+                    # Removed extra update here to keep single update at end of loop
                     last_seen = state["last_seen_timestamp"][channel_id]
                     continue
 
@@ -214,12 +216,16 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     list(TG_CHANNELS.values())[0]
                 )
 
-                if is_scheduled_live and not live_state["scheduled_notified"]:
-                    # Если стрим уже был зафиксирован ранее — не слать повторно
-                    if live_key in state["live_streams"] and state["live_streams"][live_key].get("scheduled_notified"):
-                        logger.debug(f"Scheduled уже отправлен ранее | {title}")
-                        continue
+                event_type = "scheduled" if is_scheduled_live else "live" if is_live else "video"
+                event_key = f"{channel_id}|{latest_video_id}|{event_type}"
 
+                # TTL-антидубликат
+                last_sent = state["sent_events"].get(event_key)
+                if last_sent and now_ts - last_sent < EVENT_TTL:
+                    logger.warning(f"Дубликат подавлен (TTL): {event_key}")
+                    continue
+
+                if is_scheduled_live and not live_state["scheduled_notified"]:
                     time_block = (
                         f"🗓 <b>Дата и время:</b> {scheduled_time}\n\n"
                         if scheduled_time else ""
@@ -235,6 +241,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     )
                     live_state["scheduled_notified"] = True
                     state["live_streams"][live_key] = live_state
+                    video_state["published"] = True
 
                 elif is_live and not live_state["live_notified"]:
                     caption = (
@@ -266,8 +273,9 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 thumb = None
-                if hasattr(latest, 'media_thumbnail') and latest.media_thumbnail:
-                    thumb = latest.media_thumbnail[0]['url']
+                media = entry.get("media_thumbnail")
+                if isinstance(media, list) and media:
+                    thumb = media[0].get("url")
 
                 video_state["published"] = True
                 state["videos"][latest_video_id] = video_state
@@ -280,7 +288,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
                 await asyncio.sleep(ANTISPAM_DELAY)
 
-                if thumb:
+                if thumb and isinstance(thumb, str):
                     await context.bot.send_photo(
                         chat_id=tg_channel,
                         photo=thumb,
@@ -294,42 +302,51 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML
                     )
 
+                state["sent_events"][event_key] = now_ts
 
                 logger.info(
                     f"Отправлено уведомление: "
                     f"{'LIVE' if is_live else 'SCHEDULED' if is_scheduled_live else 'VIDEO'} | {title} | key={live_key}"
                 )
 
-        if not state.get("initialized"):
-            state["initialized"] = True
+        state["initialized"] = True
+
+        # Очистка старых событий
+        for k, ts in list(state["sent_events"].items()):
+            if now_ts - ts > EVENT_TTL:
+                del state["sent_events"][k]
 
     finally:
-        state["processing_lock"] = False
         save_state(state)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Бот запущен и отслеживает YouTube‑каналы."
-    )
+    if update.message:
+        await update.message.reply_text(
+            f"🤖 Бот запущен (v{VERSION}) и отслеживает YouTube‑каналы."
+        )
 
 async def checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Ручная проверка запущена")
+    if update.message:
+        await update.message.reply_text("🔄 Ручная проверка запущена")
     await check_updates(context)
 
 def main():
+    assert TELEGRAM_TOKEN
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     # Планировщик задач (JobQueue) уже инициализирован внутри Application
-    app.job_queue.run_repeating(
-        check_updates,
-        interval=1800,
-        first=10
-    )
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            check_updates,
+            interval=1800,
+            first=10
+        )
 
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('checknow', checknow))
 
+    logger.info(f"Версия бота: v{VERSION}")
     logger.info("Бот успешно запущен")
     app.run_polling()
 
