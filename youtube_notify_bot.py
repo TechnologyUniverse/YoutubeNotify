@@ -20,8 +20,24 @@ from typing import Any, Dict, cast
 import time as _time
 from datetime import datetime, timezone
 
-VERSION = "1.1.17"
-# Stable / Production
+VERSION = "1.2.0"
+# =========================================================
+# RELEASE: v1.2.0 (STABLE)
+# Project: Technology Universe — YouTube Alerts
+#
+# ✔ Multi-channel YouTube RSS tracking
+# ✔ Scheduled stream notifications (with date & time)
+# ✔ Live stream start detection (with fallback)
+# ✔ New video notifications
+# ✔ Shorts filtering (#shorts, /shorts/)
+# ✔ Per-channel last_seen_timestamp
+# ✔ TTL-based deduplication (anti-spam)
+# ✔ State persistence (state.json)
+# ✔ Telegram channel routing per YouTube channel
+#
+# Status: Production-ready
+# Branch: 1.2.x
+# =========================================================
 
 LOG_FILE = 'bot.log'
 STATE_FILE = 'state.json'
@@ -174,10 +190,22 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 is_scheduled_live = False
                 is_live = False
 
+                now_utc = int(time.time())
+
                 if broadcast == "live":
                     is_live = True
+
                 elif broadcast == "upcoming":
                     is_scheduled_live = True
+
+                    # FALLBACK: YouTube RSS не всегда меняет статус на "live"
+                    if (
+                        live_state.get("scheduled_notified")
+                        and not live_state.get("live_notified")
+                        and published_ts <= now_utc
+                    ):
+                        is_live = True
+                        is_scheduled_live = False
                 else:
                     if 'live' in title_lower or 'стрим' in title_lower:
                         is_scheduled_live = True
