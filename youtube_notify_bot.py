@@ -22,8 +22,8 @@ from telegram.ext import (
 from typing import Any, Dict, cast
 from datetime import datetime, timezone
 
-# v1.2.9.30 — Stable Production Release (1.2.x LTS)
-VERSION = "1.2.9.30"
+# v1.2.9.32 — Stable Production Release (1.2.x LTS)
+VERSION = "1.2.9.32"
 # v1.2.15–v1.2.16
 # - Fixed invalid try/except structure
 # - Fixed unsafe dict.get usage with None keys
@@ -326,7 +326,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     video_state = state["videos"].get(latest_video_id, {
                         "scheduled_notified": False,
                         "live_notified": False,
-                        "published": False
+                        "published": False,
+                        "was_live": False
                     })
 
                     live_key = make_live_key(channel_id, latest_video_id)
@@ -498,6 +499,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         and not video_state.get("published", False)
                         and not live_state.get("live_notified", False)
                     ):
+                        if video_state.get("was_live"):
+                            continue
                         event_type = "video"
 
                     # HARD DEDUP: блокируем повторные video-события
@@ -557,6 +560,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                             f"#live #стрим #youtube"
                         )
                         live_state["live_notified"] = True
+                        video_state["was_live"] = True
                         state["live_streams"][live_key] = live_state
                         state["stream_started_at"][live_key] = now_ts
                         video_state["published"] = True
@@ -596,24 +600,33 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                                 published_ts
                             )
 
-                        try:
-                            if thumb and isinstance(thumb, str):
-                                await context.bot.send_photo(
-                                    chat_id=tg_channel,
-                                    photo=thumb,
-                                    caption=caption,
-                                    parse_mode=ParseMode.HTML
-                                )
-                            else:
-                                await context.bot.send_message(
-                                    chat_id=tg_channel,
-                                    text=caption,
-                                    parse_mode=ParseMode.HTML
-                                )
-                        except Exception as e:
-                            logger.error(
-                                f"telegram_send_failed | channel={tg_channel} | error={e}"
-                            )
+                        for attempt in range(3):
+                            try:
+                                if thumb and isinstance(thumb, str):
+                                    await context.bot.send_photo(
+                                        chat_id=tg_channel,
+                                        photo=thumb,
+                                        caption=caption,
+                                        parse_mode=ParseMode.HTML
+                                    )
+                                else:
+                                    await context.bot.send_message(
+                                        chat_id=tg_channel,
+                                        text=caption,
+                                        parse_mode=ParseMode.HTML
+                                    )
+                                break
+                            except Exception as e:
+                                if attempt == 2:
+                                    logger.error(
+                                        f"telegram_send_failed | channel={tg_channel} | attempts=3 | error={e}"
+                                    )
+                                else:
+                                    backoff = 2 ** attempt
+                                    logger.warning(
+                                        f"telegram_retry | channel={tg_channel} | attempt={attempt+1} | wait={backoff}s"
+                                    )
+                                    await asyncio.sleep(backoff)
 
                         await asyncio.sleep(ANTISPAM_DELAY)
                         # (Удалено обновление last_seen_timestamp после отправки)
