@@ -22,8 +22,8 @@ from telegram.ext import (
 from typing import Any, Dict, cast
 from datetime import datetime, timezone
 
-# v1.2.9.32 — Stable Production Release (1.2.x LTS)
-VERSION = "1.2.9.32"
+# v1.2.9.34 — Stable Production Release (1.2.x LTS)
+VERSION = "1.2.9.34"
 # v1.2.15–v1.2.16
 # - Fixed invalid try/except structure
 # - Fixed unsafe dict.get usage with None keys
@@ -340,6 +340,12 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
                     broadcast = entry.get("yt_livebroadcastcontent", "")
                     broadcast = broadcast.lower() if isinstance(broadcast, str) else ""
+
+                    # HARD GUARD: explicit yt:liveBroadcastContent=none
+                    # Если YouTube явно сообщает, что стрима нет — запрещаем любые live/fallback
+                    if broadcast == "none":
+                        is_live = False
+                        is_scheduled_live = False
 
                     scheduled_time = None
                     raw_ts = entry.get("yt_scheduledstarttime")
