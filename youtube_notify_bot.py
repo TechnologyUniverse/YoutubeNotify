@@ -25,7 +25,7 @@ from typing import Any, Dict, cast
 from datetime import datetime, timezone
 
 #
-# v1.2.9.30.300 — Stable Production Release (LTS)
+# v1.2.9.40.400 — Stable Production Release (LTS)
 # Status: Stable Prod
 # Branch: 1.2.x (frozen)
 #
@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 # - No duplicate notifications
 # - No false "new video" after streams
 #
-VERSION = "1.2.9.30.300-stable-prod"
+VERSION = "1.2.9.40.400-stable-prod"
 SILENT_MODE = os.getenv("SILENT_MODE", "false").lower() == "true"
 
 # ---------------------------------------------------------
@@ -78,6 +78,12 @@ SILENT_MODE = os.getenv("SILENT_MODE", "false").lower() == "true"
 # - Automatic cleanup of live_state after stream end
 # - No false "new video" notifications after streams
 # - Marked as final stable LTS build
+#
+# v1.2.9.40.400
+# - Video delivery reliability fix
+# - Removed time-based baseline suppression
+# - Event delivery strictly once per event_key
+# - Marked as Stable Production build
 
 LOG_FILE = 'bot.log'
 
@@ -113,7 +119,7 @@ ENDED_CLEANUP_TTL = 60 * 60  # 1 час после завершения стри
 # RSS schema version
 RSS_SCHEMA_VERSION = "youtube_rss_2026_01"
 # State versioning and migrations
-STATE_VERSION = "1.2.9.30.300"
+STATE_VERSION = "1.2.9.40.400"
 STATE_MIGRATIONS = {
     "1.2.x": "1.2.9.30",
 }
@@ -326,9 +332,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         published_ts = None
 
-                    # Ensure published_ts is not None before comparing
-                    if published_ts is not None and published_ts <= state["last_seen_timestamp"].get(channel_id, 0):
-                        continue
                     if published_ts is None:
                         logger.warning(
                             f"skip_no_timestamp | канал={channel_id} | видео={entry.get('yt_videoid')} | {title}"
@@ -341,6 +344,15 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     latest_video_id = latest_video_id_raw
+
+                    # HARD GUARD: deduplicate video events strictly by sent_events (ignore last_seen_timestamp)
+                    event_key_video = f"{channel_id}|{latest_video_id}|video"
+                    last_sent_video = state.get("sent_events", {}).get(event_key_video)
+                    if last_sent_video:
+                        logger.debug(
+                            f"skip_video_already_sent | channel={channel_id} | video={latest_video_id}"
+                        )
+                        continue
 
                     video_state = state["videos"].get(latest_video_id, {
                         "scheduled_notified": False,
