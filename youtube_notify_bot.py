@@ -866,10 +866,16 @@ def main():
 
     logger.info(f"Версия бота: v{VERSION}")
     logger.info("Бот успешно запущен")
-    try:
-        app.run_polling()
-    finally:
-        logger.info("Бот завершил работу корректно")
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        logger.error("❌ WEBHOOK_URL не задан")
+        sys.exit(1)
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        webhook_url=webhook_url,
+    )
 
 if __name__ == "__main__":
     main()
