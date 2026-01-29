@@ -24,32 +24,21 @@ from telegram.ext import (
 from typing import Any, Dict, cast
 from datetime import datetime, timezone
 
-# v1.2.20.100 — Stable Production Release (1.2.x LTS)
-VERSION = "1.2.20.100-stable"
-# v1.2.15–v1.2.16
-# - Fixed invalid try/except structure
-# - Fixed unsafe dict.get usage with None keys
-# - Hardened Telegram send path
-# - Code passes static analysis (Pylance)
+#
+# v1.2.9.30.300 — Stable Production Release (LTS)
+# Status: Stable Prod
+# Branch: 1.2.x (frozen)
+#
+# 🔒 Production guarantees:
+# - Webhook-only (no polling conflicts)
+# - Strict YouTube live state machine
+# - Separate prod/test state isolation
+# - Self-healing state with safe recovery
+# - No duplicate notifications
+# - No false "new video" after streams
+#
+VERSION = "1.2.9.30.300-stable-prod"
 SILENT_MODE = os.getenv("SILENT_MODE", "false").lower() == "true"
-#
-# RELEASE: v{VERSION}
-# Status: Stable (LTS)
-# Project: Technology Universe — YouTube Alerts
-#
-# 🎯 Цель версии 1.2.x:
-# - Повышение надёжности работы в production
-# - Закрытие edge-кейсов YouTube RSS
-# - Усиленный контроль live-событий
-# - Исключение ложных срабатываний (shorts / старые видео)
-# - Жёсткая дедупликация scheduled / live / video
-# - Защита от повторных уведомлений после рестартов
-#
-# Тип релиза: Maintenance / Stabilization
-# Новая функциональность: ❌ не добавлялась
-#
-# Branch: 1.2.x
-# =========================================================
 
 # ---------------------------------------------------------
 # Maintenance history (1.2.x):
@@ -124,7 +113,7 @@ ENDED_CLEANUP_TTL = 60 * 60  # 1 час после завершения стри
 # RSS schema version
 RSS_SCHEMA_VERSION = "youtube_rss_2026_01"
 # State versioning and migrations
-STATE_VERSION = "1.2.20.100"
+STATE_VERSION = "1.2.9.30.300"
 STATE_MIGRATIONS = {
     "1.2.x": "1.2.9.30",
 }
