@@ -17,6 +17,7 @@ bot.log
 
 # ===== State / runtime files =====
 state.json
+state*.json
 
 # ===== OS =====
 .DS_Store

@@ -8,6 +8,8 @@ import time
 from time import struct_time
 from calendar import timegm
 import urllib.request
+import ssl
+import certifi
 RUN_LOCK = None  # asyncio.Lock инициализируется лениво внутри event loop
 
 from dotenv import load_dotenv
@@ -22,8 +24,8 @@ from telegram.ext import (
 from typing import Any, Dict, cast
 from datetime import datetime, timezone
 
-# v1.2.9.34 — Stable Production Release (1.2.x LTS)
-VERSION = "1.2.9.34"
+# v1.2.20.100 — Stable Production Release (1.2.x LTS)
+VERSION = "1.2.20.100-stable"
 # v1.2.15–v1.2.16
 # - Fixed invalid try/except structure
 # - Fixed unsafe dict.get usage with None keys
@@ -81,21 +83,48 @@ SILENT_MODE = os.getenv("SILENT_MODE", "false").lower() == "true"
 # - LTS stable cut of 1.2.x branch
 # - All critical logic frozen
 # - No further changes without major version bump
+# v1.2.9.40
+# - Strict yt:liveBroadcastContent guard finalized
+# - Correct handling of scheduled/live/video transitions
+# - Automatic cleanup of live_state after stream end
+# - No false "new video" notifications after streams
+# - Marked as final stable LTS build
 
 LOG_FILE = 'bot.log'
-STATE_FILE = 'state.json'
+
+BOT_ENV = os.getenv("BOT_ENV", "prod").lower()
+
+# Раздельные state-файлы для prod / test
+STATE_FILE = f"state.{BOT_ENV}.json"
+
+
+# 🧼 Автомиграция legacy state.json → prod only
+if BOT_ENV == "prod" and os.path.exists("state.json") and not os.path.exists("state.prod.json"):
+    import shutil
+    shutil.move("state.json", "state.prod.json")
+    logging.warning("state_migrate | legacy state.json -> state.prod.json")
+
+# 🧪 Test окружение всегда изолированное и чистое
+if BOT_ENV == "test" and not os.path.exists("state.test.json"):
+    with open("state.test.json", "w", encoding="utf-8") as f:
+        json.dump({}, f)
+
 ANTISPAM_DELAY = 5
 EVENT_TTL_DEFAULT = 6 * 60 * 60
 EVENT_TTL_BY_TYPE = {
     "scheduled": 12 * 60 * 60,
     "live": 6 * 60 * 60,
+    "ended": 6 * 60 * 60,
     "video": 24 * 60 * 60,
 }
+
+# TTL очистки завершённых стримов
+ENDED_CLEANUP_TTL = 60 * 60  # 1 час после завершения стрима
 
 # RSS schema version
 RSS_SCHEMA_VERSION = "youtube_rss_2026_01"
 # State versioning and migrations
-STATE_VERSION = "1.2.9.30"
+STATE_VERSION = "1.2.20.100"
 STATE_MIGRATIONS = {
     "1.2.x": "1.2.9.30",
 }
@@ -179,7 +208,8 @@ def fetch_feed(channel_id: str):
         }
     )
 
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
         data = resp.read()
 
     feed = feedparser.parse(data)
@@ -334,6 +364,13 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     stream_started_at = state["stream_started_at"].get(live_key)
                     last_live_check = state["live_checked_at"].get(live_key, 0)
 
+                    # Ensure live_state is always initialized before use
+                    live_state = state["live_streams"].get(live_key, {
+                        "scheduled_notified": False,
+                        "live_notified": False,
+                        "ended_notified": False
+                    })
+
                     channel_name = CHANNEL_NAMES.get(channel_id, "YouTube")
 
                     title_lower = title.lower() if isinstance(title, str) else ""
@@ -341,11 +378,39 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     broadcast = entry.get("yt_livebroadcastcontent", "")
                     broadcast = broadcast.lower() if isinstance(broadcast, str) else ""
 
-                    # HARD GUARD: explicit yt:liveBroadcastContent=none
-                    # Если YouTube явно сообщает, что стрима нет — запрещаем любые live/fallback
-                    if broadcast == "none":
+                    is_scheduled_live = False
+                    is_live = False
+
+                    # === STRICT YouTube live state handling ===
+                    if broadcast == "upcoming":
+                        is_scheduled_live = True
+                    elif broadcast == "live":
+                        is_live = True
+                    elif broadcast == "none":
                         is_live = False
                         is_scheduled_live = False
+
+                    # 🔴 LIVE ENDED — отдельное уведомление
+                    if (
+                        broadcast == "none"
+                        and video_state.get("was_live")
+                        and not live_state.get("ended_notified")
+                    ):
+                        caption = (
+                            f"🔴 <b>Стрим завершён</b>\n\n"
+                            f"📺 <b>{title}</b>\n"
+                            f"🏷 <i>{channel_name}</i>\n\n"
+                            f"👉 <a href=\"{link}\">Смотреть запись</a>\n\n"
+                            f"#live #стрим #youtube"
+                        )
+
+                        live_state["ended_notified"] = True
+                        video_state["published"] = True
+
+                        state["live_streams"][live_key] = live_state
+                        state["videos"][latest_video_id] = video_state
+
+                        event_type = "ended"
 
                     scheduled_time = None
                     raw_ts = entry.get("yt_scheduledstarttime")
@@ -364,18 +429,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             scheduled_time = None
 
-                    live_state = state["live_streams"].get(live_key, {
-                        "scheduled_notified": False,
-                        "live_notified": False
-                    })
-
-                    is_scheduled_live = False
-                    is_live = False
 
                     now_utc = int(time.time())
-
-                    if broadcast == "live":
-                        is_live = True
 
                     # FALLBACK LEVEL 2: стрим мог начаться без обновления RSS
                     if (
@@ -406,21 +461,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                                 f"live_fallback_no_rss | канал={channel_id} | видео={latest_video_id} | {title}"
                             )
                             is_live = True
-
-                    elif broadcast == "upcoming":
-                        is_scheduled_live = True
-
-                        # FALLBACK: YouTube RSS не всегда меняет статус на "live"
-                        if (
-                            live_state.get("scheduled_notified")
-                            and not live_state.get("live_notified")
-                            and published_ts is not None
-                            and published_ts <= now_utc
-                            and now_utc - published_ts < 6 * 60 * 60
-                        ):
-                            is_live = True
-                            is_scheduled_live = False
-                    # (Удалена эвристика title → scheduled)
 
                     is_premiere = False
 
@@ -487,6 +527,29 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         state["live_streams"][live_key] = live_state
                         continue
 
+                    # HARD GUARD: upcoming стрим никогда не считается VIDEO
+                    if is_scheduled_live:
+                        event_type = None
+
+                    # HARD GUARD: LIVE (past or scheduled) никогда не считается VIDEO
+                    if (
+                        broadcast == "none"
+                        and (
+                            video_state.get("was_live")
+                            or live_state.get("live_notified")
+                            or live_key in state.get("stream_started_at", {})
+                            or live_state.get("scheduled_notified")
+                        )
+                    ):
+                        logger.info(
+                            f"hard_live_or_scheduled_end_guard | channel={channel_id} | video={latest_video_id}"
+                        )
+                        live_state["ended_notified"] = True
+                        video_state["published"] = True
+                        state["videos"][latest_video_id] = video_state
+                        state["live_streams"][live_key] = live_state
+                        continue
+
                     # Deduplication hardening: event_key includes event_type only once per transition
                     event_type = None
                     if is_scheduled_live and not live_state.get("scheduled_notified", False):
@@ -501,12 +564,12 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     elif (
                         not is_scheduled_live
                         and not is_live
+                        and broadcast == "none"
                         and not is_premiere
                         and not video_state.get("published", False)
                         and not live_state.get("live_notified", False)
+                        and not video_state.get("was_live")
                     ):
-                        if video_state.get("was_live"):
-                            continue
                         event_type = "video"
 
                     # HARD DEDUP: блокируем повторные video-события
@@ -553,7 +616,9 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                             f"👉 <a href=\"{link}\">Перейти к стриму</a>\n\n"
                             f"#live #youtube"
                         )
+                        # Жёсткая фиксация
                         live_state["scheduled_notified"] = True
+                        video_state["published"] = False
                         state["live_streams"][live_key] = live_state
                         state["videos"][latest_video_id] = video_state
 
@@ -697,18 +762,33 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             for k, ts in list(state.get("stream_started_at", {}).items()):
                 if isinstance(ts, int) and now_ts - ts > live_ttl:
                     state["stream_started_at"].pop(k, None)
-            # Очистка старых live_streams
+
+            # Очистка live_streams (завершённые стримы + устаревшие)
             stream_started = state.get("stream_started_at")
             if not isinstance(stream_started, dict):
                 stream_started = {}
                 state["stream_started_at"] = stream_started
-            live_ttl = EVENT_TTL_BY_TYPE["live"]
+
             for k, v in list(state.get("live_streams", {}).items()):
                 if not isinstance(v, dict):
                     state["live_streams"].pop(k, None)
                     continue
-                last_event_ts = stream_started.get(k)
-                if isinstance(last_event_ts, int) and now_ts - last_event_ts > live_ttl:
+
+                # 🧼 Завершённый стрим — мягкая очистка после TTL
+                if v.get("ended_notified"):
+                    started_at = stream_started.get(k)
+                    if isinstance(started_at, int) and now_ts - started_at > ENDED_CLEANUP_TTL:
+                        state["live_streams"].pop(k, None)
+                        stream_started.pop(k, None)
+                        state.get("live_checked_at", {}).pop(k, None)
+                        logger.info(f"cleanup_live_ended | {k}")
+                        # scheduled_guard_active log
+                        logger.info(f"scheduled_guard_active | {k.split('|')[1] if '|' in k else k}")
+                    continue
+
+                # fallback: защита от вечных live-маркеров
+                started_at = stream_started.get(k)
+                if isinstance(started_at, int) and now_ts - started_at > EVENT_TTL_BY_TYPE["live"]:
                     state["live_streams"].pop(k, None)
             # Очистка старых live_checked_at
             live_checked = state.get("live_checked_at")
