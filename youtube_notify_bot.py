@@ -22,11 +22,11 @@ from telegram.ext import (
 load_dotenv()
 
 # =========================================================
-# v1.2.9.40.500 — Stable Production Release (LTS)
+# v1.2.9.40.600 — Hardened Production Release (LTS)
 # =========================================================
 
-VERSION = "1.2.9.40.500-stable-prod"
-STATE_VERSION = "1.2.9.40.500"
+VERSION = "1.2.9.40.600-hardened-prod"
+STATE_VERSION = "1.2.9.40.600"
 
 SILENT_MODE = os.getenv("SILENT_MODE", "false").lower() == "true"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -84,18 +84,24 @@ if not TG_CHANNELS:
 # =========================================================
 
 def load_state():
-    if os.path.exists(STATE_FILE):
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {}
+    except Exception as e:
+        logger.error(f"state_load_error | {e}")
+        return {}
 
 
 def save_state(state):
     tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        logger.error(f"state_save_error | {e}")
 
 # =========================================================
 # RSS
@@ -130,6 +136,8 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     async with RUN_LOCK:
         state = load_state()
 
+        state.setdefault("baseline_initialized", False)
+
         state.setdefault("state_version", STATE_VERSION)
         state.setdefault("videos", {})
         state.setdefault("live_streams", {})
@@ -141,22 +149,46 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
         for k in expired:
             del state["sent_events"][k]
 
+        # =====================================================
+        # GLOBAL BASELINE (no spam on first launch)
+        # =====================================================
+        if BASELINE_MODE and not state.get("baseline_initialized"):
+            logger.info("baseline_start_initializing")
+
+            for channel_id in YOUTUBE_CHANNEL_IDS:
+                try:
+                    feed = fetch_feed(channel_id)
+                except Exception as e:
+                    logger.error(f"rss_error | {channel_id} | {e}")
+                    continue
+
+                for entry in feed.entries:
+                    vid = entry.get("yt_videoid")
+                    if not vid:
+                        continue
+
+                    state["videos"].setdefault(vid, {
+                        "published": True,
+                        "was_live": False,
+                    })
+
+                    live_key = f"{channel_id}|{vid}"
+                    state["live_streams"].setdefault(live_key, {
+                        "scheduled": False,
+                        "live": False,
+                        "ended": False,
+                    })
+
+            state["baseline_initialized"] = True
+            save_state(state)
+            logger.info("baseline_completed_no_events_sent")
+            return
+
         for channel_id in YOUTUBE_CHANNEL_IDS:
             try:
                 feed = fetch_feed(channel_id)
             except Exception as e:
                 logger.error(f"rss_error | {channel_id} | {e}")
-                continue
-
-            # Baseline режим — при первом запуске просто фиксируем текущие видео
-            if BASELINE_MODE and not state.get("baseline_initialized"):
-                for entry in feed.entries:
-                    vid = entry.get("yt_videoid")
-                    if vid:
-                        state["videos"].setdefault(vid, {"published": True, "was_live": False})
-                state["baseline_initialized"] = True
-                save_state(state)
-                logger.info("baseline_initialized")
                 continue
 
             if not feed.entries:
@@ -232,7 +264,11 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         await context.bot.send_message(
                             chat_id=str(chat_id),
-                            text=caption
+                            text=caption,
+                            disable_web_page_preview=True,
+                            connect_timeout=10,
+                            read_timeout=10,
+                            write_timeout=10,
                         )
                     except Exception as e:
                         logger.error(f"telegram_error | {e}")
@@ -332,6 +368,10 @@ def main():
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
         logger.error("❌ WEBHOOK_URL не задан")
+        sys.exit(1)
+
+    if not webhook_url.startswith("https://"):
+        logger.error("❌ WEBHOOK_URL должен начинаться с https://")
         sys.exit(1)
 
     logger.info(f"Webhook URL: {webhook_url}")
