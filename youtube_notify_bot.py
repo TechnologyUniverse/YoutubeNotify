@@ -25,8 +25,8 @@ load_dotenv()
 # v1.2.9.40.600 — Hardened Production Release (LTS)
 # =========================================================
 
-VERSION = "1.2.9.40.600-hardened-prod"
-STATE_VERSION = "1.2.9.40.600"
+VERSION = "1.3.0"
+STATE_VERSION = "1.3.0"
 
 SILENT_MODE = os.getenv("SILENT_MODE", "false").lower() == "true"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -265,7 +265,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(
                             chat_id=str(chat_id),
                             text=caption,
-                            disable_web_page_preview=True,
                             connect_timeout=10,
                             read_timeout=10,
                             write_timeout=10,
