@@ -1,1 +1,1 @@
-worker: python youtube_notify_bot.py
+worker: python main.py
