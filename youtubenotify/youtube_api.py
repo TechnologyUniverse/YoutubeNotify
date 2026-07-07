@@ -138,6 +138,15 @@ class YouTubeAPIClient:
                 if not video_id:
                     continue
                 published_at = snippet.get("publishedAt")
+                thumbnails = snippet.get("thumbnails", {})
+                thumbnail_url = next(
+                    (
+                        thumbnails[size].get("url")
+                        for size in ("maxres", "standard", "high", "medium", "default")
+                        if thumbnails.get(size, {}).get("url")
+                    ),
+                    None,
+                )
                 result.append(
                     {
                         "video_id": video_id,
@@ -146,6 +155,7 @@ class YouTubeAPIClient:
                         "published_at": published_at,
                         "published_timestamp": self._timestamp(published_at),
                         "event_status": event_status,
+                        "thumbnail_url": thumbnail_url,
                     }
                 )
 

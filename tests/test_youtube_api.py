@@ -37,6 +37,9 @@ class YouTubeAPIClientTests(unittest.TestCase):
                                 "title": "Upload",
                                 "publishedAt": "2026-07-07T10:00:00Z",
                                 "liveBroadcastContent": "none",
+                                "thumbnails": {
+                                    "high": {"url": "https://img.youtube.com/high.jpg"}
+                                },
                             },
                         },
                         {
@@ -57,6 +60,7 @@ class YouTubeAPIClientTests(unittest.TestCase):
 
         self.assertEqual([video["event_status"] for video in videos], ["video", "ended"])
         self.assertEqual(videos[0]["url"], "https://www.youtube.com/watch?v=video-1")
+        self.assertEqual(videos[0]["thumbnail_url"], "https://img.youtube.com/high.jpg")
         self.assertGreater(videos[0]["published_timestamp"], 0)
 
     def test_uploads_playlist_is_cached(self):

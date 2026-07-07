@@ -2,7 +2,8 @@ import asyncio
 import time
 import logging
 import random
-from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 from telegram.ext import ContextTypes
 from .config import (
     YOUTUBE_CHANNEL_IDS,
@@ -73,7 +74,7 @@ class Engine:
         self.last_telegram_send = 0.0
         self.telegram_min_interval = 1.0  # seconds
 
-    async def _safe_send(self, context, chat_id, text):
+    async def _safe_send(self, context, chat_id, text, video_url, thumbnail_url=None):
         max_attempts = 5
         base_delay = 1.0
 
@@ -84,10 +85,33 @@ class Engine:
                 if elapsed < self.telegram_min_interval:
                     await asyncio.sleep(self.telegram_min_interval - elapsed)
 
-                await context.bot.send_message(
-                    chat_id=str(chat_id),
-                    text=text,
+                reply_markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Смотреть на YouTube", url=video_url)]]
                 )
+                if thumbnail_url:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=str(chat_id),
+                            photo=thumbnail_url,
+                            caption=text,
+                            reply_markup=reply_markup,
+                        )
+                    except BadRequest as exc:
+                        self._log_telegram(
+                            logging.WARNING,
+                            f"type=thumbnail_fallback | error={exc}",
+                        )
+                        await context.bot.send_message(
+                            chat_id=str(chat_id),
+                            text=text,
+                            reply_markup=reply_markup,
+                        )
+                else:
+                    await context.bot.send_message(
+                        chat_id=str(chat_id),
+                        text=text,
+                        reply_markup=reply_markup,
+                    )
 
                 self.last_telegram_send = time.time()
                 return True
@@ -331,13 +355,21 @@ class Engine:
                         )
                         continue
                     else:
-                        text = (
-                            f"[{event_type.upper()}]\n"
-                            f"{entry.get('title','')}\n"
-                            f"{entry.get('url','')}"
-                        )
+                        event_labels = {
+                            "video": "Новое видео",
+                            "scheduled": "Запланирован стрим",
+                            "live": "Стрим начался",
+                            "ended": "Стрим завершён",
+                        }
+                        text = f"{event_labels[event_type]}\n\n{entry.get('title', '')}"
 
-                        success = await self._safe_send(context, chat_id, text)
+                        success = await self._safe_send(
+                            context,
+                            chat_id,
+                            text,
+                            entry.get("url", ""),
+                            entry.get("thumbnail_url"),
+                        )
                         if not success:
                             telegram_failures_this_run += 1
                             self.telegram_failures_total += 1
