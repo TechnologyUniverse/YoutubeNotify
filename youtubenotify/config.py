@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "1.5.1.10000"
-STATE_VERSION = "1.5.1.10000"
+VERSION = "2.0.0"
+STATE_SCHEMA_VERSION = 2
 
 APP_START_TIME = None  # will be set in main at runtime
 
@@ -20,6 +20,7 @@ BOT_ENV = os.getenv("BOT_ENV", "prod").lower()
 STATE_FILE = f"state.{BOT_ENV}.json"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -53,6 +54,9 @@ def validate_config():
 
     if not TELEGRAM_TOKEN:
         errors.append("TELEGRAM_TOKEN is missing")
+
+    if not YOUTUBE_API_KEY:
+        errors.append("YOUTUBE_API_KEY is missing")
 
     if BOT_ENV == "prod" and not WEBHOOK_URL:
         errors.append("WEBHOOK_URL required in prod")

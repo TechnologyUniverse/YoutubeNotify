@@ -12,10 +12,11 @@ from .config import (
     EVENT_TTL,
     MAX_EVENTS_PER_RUN,
     MAX_FEED_ITEMS,
-    STATE_VERSION,
+    STATE_SCHEMA_VERSION,
+    YOUTUBE_API_KEY,
 )
-from .rss import RSSClient
 from .state import StateManager
+from .youtube_api import YouTubeAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class Engine:
     def __init__(self, state_manager: StateManager):
         self.state_manager = state_manager
         self.run_lock = asyncio.Lock()
-        self.rss = RSSClient()
+        self.youtube = YouTubeAPIClient(YOUTUBE_API_KEY)
         # Metrics (v1.4.2 - no globals)
         self.safe_mode_active = False
         self.last_event_sent = 0
@@ -37,7 +38,7 @@ class Engine:
         self.start_time = int(time.time())
         self.last_run_duration = 0
         self.telegram_failures_total = 0
-        self.rss_failures_total = 0
+        self.youtube_failures_total = 0
         self.circuit_breaker_triggers = 0
 
         # Circuit Breaker (v1.4.4)
@@ -53,8 +54,8 @@ class Engine:
         def _log_event(self, level, message):
             logger.log(level, f"[EVENT] {message}")
 
-        def _log_rss(self, level, message):
-            logger.log(level, f"[RSS] {message}")
+        def _log_youtube(self, level, message):
+            logger.log(level, f"[YOUTUBE_API] {message}")
 
         def _log_telegram(self, level, message):
             logger.log(level, f"[TELEGRAM] {message}")
@@ -64,7 +65,7 @@ class Engine:
 
         self._log_system = _log_system.__get__(self)
         self._log_event = _log_event.__get__(self)
-        self._log_rss = _log_rss.__get__(self)
+        self._log_youtube = _log_youtube.__get__(self)
         self._log_telegram = _log_telegram.__get__(self)
         self._log_circuit = _log_circuit.__get__(self)
 
@@ -138,12 +139,13 @@ class Engine:
         state = self.state_manager.load()
 
         # ---- STATE INIT ----
-        if state.get("state_version") != STATE_VERSION:
+        if state.get("schema_version") != STATE_SCHEMA_VERSION:
             self._log_system(
                 logging.WARNING,
-                f"state_migrate | {state.get('state_version')} -> {STATE_VERSION}"
+                f"state_migrate | {state.get('schema_version')} -> {STATE_SCHEMA_VERSION}"
             )
-            state["state_version"] = STATE_VERSION
+            state.pop("state_version", None)
+            state["schema_version"] = STATE_SCHEMA_VERSION
 
         state.setdefault("baseline_initialized", False)
         state.setdefault("videos", {})
@@ -162,14 +164,16 @@ class Engine:
 
         # ---- BASELINE INIT ----
         if BASELINE_MODE and not state.get("baseline_initialized"):
+            baseline_success = True
             for channel_id in YOUTUBE_CHANNEL_IDS:
                 try:
                     entries = await asyncio.wait_for(
-                        asyncio.to_thread(self.rss.fetch, channel_id),
+                        asyncio.to_thread(self.youtube.fetch, channel_id, MAX_FEED_ITEMS),
                         timeout=15
                     )
                 except Exception as e:
-                    self._log_rss(
+                    baseline_success = False
+                    self._log_youtube(
                         logging.ERROR,
                         f"baseline_fetch_error | {channel_id} | {e}"
                     )
@@ -179,19 +183,31 @@ class Engine:
                     continue
 
                 for entry in entries:
-                    vid = entry.get("yt_videoid")
+                    vid = entry.get("video_id")
                     if not vid:
                         continue
 
+                    status = entry.get("event_status", "video")
+                    was_live = status in ("live", "ended")
+
                     state["videos"].setdefault(
-                        vid, {"published": True, "was_live": False}
+                        vid, {"published": True, "was_live": was_live}
                     )
 
                     live_key = f"{channel_id}|{vid}"
                     state["live_streams"].setdefault(
                         live_key,
-                        {"scheduled": False, "live": False, "ended": False},
+                        {
+                            "scheduled": status in ("upcoming", "live", "ended"),
+                            "live": status in ("live", "ended"),
+                            "ended": status == "ended",
+                        },
                     )
+
+            if not baseline_success:
+                self._log_system(logging.WARNING, "baseline_incomplete")
+                self.state_manager.save(state)
+                return
 
             state["baseline_initialized"] = True
             self.state_manager.save(state)
@@ -217,19 +233,19 @@ class Engine:
 
             try:
                 entries = await asyncio.wait_for(
-                    asyncio.to_thread(self.rss.fetch, channel_id),
+                    asyncio.to_thread(self.youtube.fetch, channel_id, MAX_FEED_ITEMS),
                     timeout=15
                 )
             except Exception as e:
-                self._log_rss(
+                self._log_youtube(
                     logging.ERROR,
                     f"fetch_timeout_or_error | {channel_id} | {e}"
                 )
-                self.rss_failures_total += 1
+                self.youtube_failures_total += 1
                 entries = []
 
             if not isinstance(entries, list):
-                self._log_rss(
+                self._log_youtube(
                     logging.ERROR,
                     f"invalid_feed_type | {channel_id} | {type(entries)}"
                 )
@@ -251,22 +267,17 @@ class Engine:
                 self.channel_failures[channel_id] = 0
 
             entries.sort(
-                key=lambda e: e.get("published_parsed")
-                or e.get("updated_parsed")
-                or 0
+                key=lambda e: e.get("published_timestamp", 0)
             )
 
             entries = entries[-MAX_FEED_ITEMS:]
 
             for entry in entries:
-                video_id = entry.get("yt_videoid")
+                video_id = entry.get("video_id")
                 if not video_id:
                     continue
 
-                raw_broadcast = entry.get("yt_livebroadcastcontent")
-                broadcast = (
-                    str(raw_broadcast).lower() if raw_broadcast else "none"
-                )
+                broadcast = entry.get("event_status", "video")
 
                 video_state = state["videos"].setdefault(
                     video_id, {"published": False, "was_live": False}
@@ -289,11 +300,14 @@ class Engine:
                     live_state["live"] = True
                     video_state["was_live"] = True
 
-                elif broadcast == "none":
-                    if video_state["was_live"] and not live_state["ended"]:
+                elif broadcast == "ended":
+                    video_state["was_live"] = True
+                    if not live_state["ended"]:
                         event_type = "ended"
                         live_state["ended"] = True
-                    elif not video_state["published"]:
+
+                elif broadcast == "video":
+                    if not video_state["published"]:
                         event_type = "video"
                         video_state["published"] = True
 
@@ -320,7 +334,7 @@ class Engine:
                         text = (
                             f"[{event_type.upper()}]\n"
                             f"{entry.get('title','')}\n"
-                            f"{entry.get('link','')}"
+                            f"{entry.get('url','')}"
                         )
 
                         success = await self._safe_send(context, chat_id, text)

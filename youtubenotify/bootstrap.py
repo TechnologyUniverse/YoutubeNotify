@@ -1,7 +1,8 @@
 import os
 import logging
+import time
 from telegram.ext import ApplicationBuilder
-from .config import TELEGRAM_TOKEN
+from .config import STATE_FILE, TELEGRAM_TOKEN
 from .commands import register_commands
 from .engine import Engine
 from .state import StateManager
@@ -32,7 +33,7 @@ def create_app():
         raise RuntimeError("TELEGRAM_TOKEN is not configured")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    state_file = os.getenv("STATE_FILE", "state.local.json")
+    state_file = os.getenv("STATE_FILE", STATE_FILE)
     state_manager = StateManager(state_file)
     engine = Engine(state_manager)
     app.bot_data["engine"] = engine
@@ -56,7 +57,7 @@ def create_app():
         return web.json_response({
             "status": "ok",
             "last_event_sent": engine_ref.last_event_sent,
-            "rss_failures": engine_ref.rss.consecutive_failures,
+            "youtube_api_failures": engine_ref.youtube.consecutive_failures,
             "safe_mode": engine_ref.safe_mode_active,
         })
 
@@ -67,11 +68,11 @@ def create_app():
             return web.json_response({"status": "error", "reason": "engine_missing"}, status=500)
 
         metrics_data = {
-            "uptime_seconds": engine_ref.metrics.get("uptime_seconds", 0),
-            "last_run_duration": engine_ref.metrics.get("last_run_duration", 0),
-            "telegram_failures_total": engine_ref.metrics.get("telegram_failures_total", 0),
-            "rss_failures_total": engine_ref.metrics.get("rss_failures_total", 0),
-            "circuit_breaker_triggers": engine_ref.metrics.get("circuit_breaker_triggers", 0),
+            "uptime_seconds": int(time.time()) - engine_ref.start_time,
+            "last_run_duration": engine_ref.last_run_duration,
+            "telegram_failures_total": engine_ref.telegram_failures_total,
+            "youtube_api_failures_total": engine_ref.youtube.total_failures,
+            "circuit_breaker_triggers": engine_ref.circuit_breaker_triggers,
         }
 
         return web.json_response(metrics_data)

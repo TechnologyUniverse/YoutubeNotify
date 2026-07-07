@@ -118,8 +118,8 @@ async def metrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📊 <b>Metrics</b>\n\n"
         f"Events sent: <b>{engine.events_sent_total}</b>\n"
-        f"RSS total failures: <b>{engine.rss.total_failures}</b>\n"
-        f"RSS consecutive failures: <b>{engine.rss.consecutive_failures}</b>\n"
+        f"YouTube API total failures: <b>{engine.youtube.total_failures}</b>\n"
+        f"YouTube API consecutive failures: <b>{engine.youtube.consecutive_failures}</b>\n"
         f"Check runs: <b>{engine.check_run_count}</b>\n"
         f"Avg check time: <b>{avg_time}s</b>\n"
     )
@@ -142,8 +142,8 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🩺 <b>Health</b>\n\n"
         f"Uptime: <b>{uptime}s</b>\n"
-        f"Last RSS success: <b>{_fmt_ts(engine.rss.last_success)}</b>\n"
-        f"RSS consecutive failures: <b>{engine.rss.consecutive_failures}</b>\n"
+        f"Last YouTube API success: <b>{_fmt_ts(engine.youtube.last_success)}</b>\n"
+        f"YouTube API consecutive failures: <b>{engine.youtube.consecutive_failures}</b>\n"
         f"Last event sent: <b>{_fmt_ts(engine.last_event_sent)}</b>\n"
     )
 
