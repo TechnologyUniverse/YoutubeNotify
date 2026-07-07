@@ -28,6 +28,9 @@ root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.handlers = [handler]
 
+# HTTPX logs Telegram Bot API URLs, which contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 def create_app():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is not configured")
