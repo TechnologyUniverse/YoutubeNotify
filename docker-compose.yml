@@ -1,44 +1,34 @@
-version: '3.8'
-
+name: youtubenotify
 services:
-  bot:
-    build: .
-    container_name: youtube-notify-bot
-    env_file:
-      - .env
-    restart: unless-stopped
-
-    ports:
-      - "8080:8080"
-
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
-        reservations:
-          memory: 128M
-
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-    security_opt:
-      - no-new-privileges:true
-
+  youtubenotify:
+    image: youtubenotify:2.0.1
+    container_name: youtubenotify
+    user: "10002:10002"
+    init: true
+    env_file: .env
+    environment:
+      BOT_ENV: prod
+      BOT_MODE: polling
+      STATE_FILE: /data/state.prod.json
+    volumes:
+      - /srv/storage/telegram/youtubenotify:/data
     read_only: true
     tmpfs:
-      - /tmp
-
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks: [bot]
 networks:
-  default:
-    name: youtube-notify-network
+  bot:
+    name: youtubenotify-network
+    driver: bridge

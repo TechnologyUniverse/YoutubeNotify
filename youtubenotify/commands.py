@@ -45,7 +45,7 @@ def _is_admin(update: Update) -> bool:
     admin_ids = getattr(config, "ADMIN_IDS", [])
 
     if not admin_ids:
-        return True
+        return False
 
     return update.effective_user.id in admin_ids
 
@@ -90,7 +90,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🩺 <b>Status</b>\n\n"
         f"Версия: <b>{VERSION}</b>\n"
         f"Engine loaded: <b>{'YES' if engine else 'NO'}</b>\n"
-        "Статус: <b>OK</b>"
+        f"Мониторинг: <b>{'OK' if engine and engine.last_successful_check and time.time()-engine.last_successful_check < 3900 and not engine.last_error else 'DEGRADED'}</b>\n"
+        f"Последняя успешная проверка: {_fmt_ts(engine.last_successful_check) if engine else '-'}\n"
+        f"Очередь: {engine.queue_counts if engine else {}}"
     )
 
     await message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -145,6 +147,9 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last YouTube API success: <b>{_fmt_ts(engine.youtube.last_success)}</b>\n"
         f"YouTube API consecutive failures: <b>{engine.youtube.consecutive_failures}</b>\n"
         f"Last event sent: <b>{_fmt_ts(engine.last_event_sent)}</b>\n"
+        f"Last monitoring success: <b>{_fmt_ts(engine.last_successful_check)}</b>\n"
+        f"Queue: <b>{engine.queue_counts}</b>\n"
+        f"Last error: <b>{engine.last_error or 'none'}</b>\n"
     )
 
     await message.reply_text(text, parse_mode=ParseMode.HTML)

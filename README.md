@@ -191,3 +191,13 @@ YouTube Alerts разработан исключительно для проек
 ---
 
 *YouTube Alerts — internal monitoring infrastructure of Technology Universe.*
+
+## Version 2.0.1 — production delivery
+
+The VPS runtime supports `BOT_MODE=polling` or `webhook`. `STATE_FILE=/data/state.prod.json` must be persistent. Schema 2 is migrated to schema 3 without replaying historical notifications.
+
+Events are stored in `outbox` before sending. Confirmed sends record `message_id` in `history` and update processed flags. Rate limits defer queued events; ambiguous network failures become `uncertain`, definite rejections become `failed`. Interrupted `sending` jobs become `uncertain` on restart. Inspect these jobs against Telegram history before manual recovery with the bot stopped. Never reset state to force a retry.
+
+`/status` and `/health` show monitoring freshness and queue counts. Loopback `/health` returns 503 when monitoring has never succeeded, the last successful check is older than 65 minutes, or the latest monitoring run failed. A healthy process alone does not prove successful YouTube monitoring. Monitoring remains every 30 minutes.
+
+Run tests with fixture environment: `PYTHONPATH=. python -m unittest discover -s tests`.

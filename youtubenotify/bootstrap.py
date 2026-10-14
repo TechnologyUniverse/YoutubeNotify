@@ -52,40 +52,36 @@ def create_app():
             name="check_updates",
         )
 
+    # Separate loopback HTTP listener works in polling and webhook modes.
+    from aiohttp import web
     async def health(request):
-        from aiohttp import web  # type: ignore
-        engine_ref = app.bot_data.get("engine")
-        if not engine_ref:
-            return web.json_response({"status": "error", "reason": "engine_missing"}, status=500)
-        return web.json_response({
-            "status": "ok",
-            "last_event_sent": engine_ref.last_event_sent,
-            "youtube_api_failures": engine_ref.youtube.consecutive_failures,
-            "safe_mode": engine_ref.safe_mode_active,
-        })
-
-    async def metrics(request):
-        from aiohttp import web  # type: ignore
-        engine_ref = app.bot_data.get("engine")
-        if not engine_ref:
-            return web.json_response({"status": "error", "reason": "engine_missing"}, status=500)
-
-        metrics_data = {
-            "uptime_seconds": int(time.time()) - engine_ref.start_time,
-            "last_run_duration": engine_ref.last_run_duration,
-            "telegram_failures_total": engine_ref.telegram_failures_total,
-            "youtube_api_failures_total": engine_ref.youtube.total_failures,
-            "circuit_breaker_triggers": engine_ref.circuit_breaker_triggers,
-        }
-
-        return web.json_response(metrics_data)
+        age = time.time() - engine.last_successful_check if engine.last_successful_check else None
+        healthy = (app.running and bool(app.updater and app.updater.running)
+                   and age is not None and age < 3900 and not engine.last_error)
+        return web.json_response({"status": "ok" if healthy else "degraded",
+                                  "version": "2.0.1", "last_successful_check": engine.last_successful_check,
+                                  "monitor_age_seconds": int(age) if age is not None else None,
+                                  "queue": engine.queue_counts, "last_error": engine.last_error,
+                                  "safe_mode": engine.safe_mode_active}, status=200 if healthy else 503)
 
     async def post_init(application):
-        web_app = getattr(application, "web_app", None)
-        if web_app:
-            web_app.router.add_get("/health", health)
-            web_app.router.add_get("/metrics", metrics)
+        web_app = web.Application()
+        web_app.router.add_get("/health", health)
+        runner = web.AppRunner(web_app, access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 8081).start()
+        application.bot_data["health_runner"] = runner
 
+    async def post_shutdown(application):
+        runner = application.bot_data.get("health_runner")
+        if runner:
+            await runner.cleanup()
+
+    async def on_error(update, context):
+        logger = logging.getLogger(__name__)
+        logger.warning("telegram_update_error type=%s", type(context.error).__name__)
+
+    app.add_error_handler(on_error)
     app.post_init = post_init
-
+    app.post_shutdown = post_shutdown
     return app

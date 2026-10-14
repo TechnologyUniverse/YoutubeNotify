@@ -24,40 +24,39 @@ class StateManager:
             size = os.path.getsize(self.file_path)
             if size > self.max_size_bytes:
                 logger.error(f"type=state_file_too_large | size_bytes={size}")
-                return {}
+                raise ValueError("state_invalid_or_too_large")
 
             try:
                 with open(self.file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except FileNotFoundError:
                 logger.warning("type=state_missing_during_read")
-                return {}
+                raise ValueError("state_invalid_or_too_large")
 
             if not isinstance(data, dict):
                 logger.error("type=state_invalid_format | format=not_dict")
-                return {}
+                raise ValueError("state_invalid_or_too_large")
 
             return data
 
         except json.JSONDecodeError:
             logger.error("type=state_corrupted_json | action=creating_backup")
-            self._backup_corrupted()
-            return {}
+            raise ValueError("state_corrupted_json") from None
 
         except Exception as e:
             logger.error(f"type=state_load_error | error={e}")
-            return {}
+            raise
 
     def save(self, state: dict):
         if not isinstance(state, dict):
             logger.error("type=state_save_invalid_type | format=not_dict")
-            return
+            raise ValueError("state_not_dict")
 
         try:
             serialized = json.dumps(state, ensure_ascii=False, indent=2)
             if len(serialized.encode("utf-8")) > self.max_size_bytes:
                 logger.error("type=state_save_too_large | action=aborting")
-                return
+                raise ValueError("state_save_too_large")
 
             dir_name = os.path.dirname(self.file_path)
             tmp_dir = dir_name if dir_name else None
@@ -79,7 +78,8 @@ class StateManager:
                     os.close(dir_fd)
 
         except Exception as e:
-            logger.error(f"type=state_save_error | error={e}")
+            logger.error("type=state_save_error | error_type=%s", type(e).__name__)
+            raise
 
     def _backup_corrupted(self):
         try:

@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "2.0.0"
-STATE_SCHEMA_VERSION = 2
+VERSION = "2.0.1"
+STATE_SCHEMA_VERSION = 3
 
 APP_START_TIME = None  # will be set in main at runtime
 
@@ -21,6 +21,7 @@ STATE_FILE = f"state.{BOT_ENV}.json"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+BOT_MODE = os.getenv("BOT_MODE", "webhook").lower()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -58,7 +59,10 @@ def validate_config():
     if not YOUTUBE_API_KEY:
         errors.append("YOUTUBE_API_KEY is missing")
 
-    if BOT_ENV == "prod" and not WEBHOOK_URL:
+    if BOT_MODE not in ("polling", "webhook"):
+        errors.append("BOT_MODE must be polling or webhook")
+
+    if BOT_MODE == "webhook" and not WEBHOOK_URL:
         errors.append("WEBHOOK_URL required in prod")
 
     if not YOUTUBE_CHANNEL_IDS:
@@ -66,6 +70,9 @@ def validate_config():
 
     if not TG_CHANNELS:
         errors.append("TG_CHANNELS empty")
+
+    if not ADMIN_IDS:
+        errors.append("ADMIN_IDS required")
 
     if METRICS_ENABLED and not ADMIN_IDS:
         # Not critical, but warn via config validation

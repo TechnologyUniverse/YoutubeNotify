@@ -1,407 +1,189 @@
 import asyncio
-import time
 import logging
-import random
+import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
-from telegram.ext import ContextTypes
-from .config import (
-    YOUTUBE_CHANNEL_IDS,
-    TG_CHANNELS,
-    SILENT_MODE,
-    BASELINE_MODE,
-    EVENT_TTL,
-    MAX_EVENTS_PER_RUN,
-    MAX_FEED_ITEMS,
-    STATE_SCHEMA_VERSION,
-    YOUTUBE_API_KEY,
-)
-from .state import StateManager
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
+from .config import (YOUTUBE_CHANNEL_IDS, TG_CHANNELS, SILENT_MODE, BASELINE_MODE,
+                     MAX_EVENTS_PER_RUN, MAX_FEED_ITEMS, STATE_SCHEMA_VERSION, YOUTUBE_API_KEY)
 from .youtube_api import YouTubeAPIClient
 
 logger = logging.getLogger(__name__)
+LABELS = {'video': 'Новое видео', 'scheduled': 'Запланирован стрим', 'live': 'Стрим начался', 'ended': 'Стрим завершён'}
+FLAGS = {'video': ('videos', 'published'), 'scheduled': ('live_streams', 'scheduled'),
+         'live': ('live_streams', 'live'), 'ended': ('live_streams', 'ended')}
 
-
+class DeliveryUncertain(Exception): pass
+class DeliveryRejected(Exception): pass
 
 class Engine:
-    def __init__(self, state_manager: StateManager):
+    def __init__(self, state_manager):
         self.state_manager = state_manager
         self.run_lock = asyncio.Lock()
         self.youtube = YouTubeAPIClient(YOUTUBE_API_KEY)
-        # Metrics (v1.4.2 - no globals)
         self.safe_mode_active = False
-        self.last_event_sent = 0
-        self.events_sent_total = 0
-        self.check_duration_total = 0
-        self.check_run_count = 0
-
-        # ---- Extended Metrics (v1.5.0) ----
+        self.last_event_sent = self.events_sent_total = 0
+        self.check_duration_total = self.check_run_count = 0
         self.start_time = int(time.time())
         self.last_run_duration = 0
-        self.telegram_failures_total = 0
-        self.youtube_failures_total = 0
+        self.telegram_failures_total = self.youtube_failures_total = 0
         self.circuit_breaker_triggers = 0
-
-        # Circuit Breaker (v1.4.4)
-        self.channel_failures = {}
-        self.channel_disabled_until = {}
-        self.breaker_threshold = 5
-        self.breaker_timeout = 600  # seconds
-
-        # ---- Structured Logging (v1.4.5) ----
-        def _log_system(self, level, message):
-            logger.log(level, f"[SYSTEM] {message}")
-
-        def _log_event(self, level, message):
-            logger.log(level, f"[EVENT] {message}")
-
-        def _log_youtube(self, level, message):
-            logger.log(level, f"[YOUTUBE_API] {message}")
-
-        def _log_telegram(self, level, message):
-            logger.log(level, f"[TELEGRAM] {message}")
-
-        def _log_circuit(self, level, message):
-            logger.log(level, f"[CIRCUIT] {message}")
-
-        self._log_system = _log_system.__get__(self)
-        self._log_event = _log_event.__get__(self)
-        self._log_youtube = _log_youtube.__get__(self)
-        self._log_telegram = _log_telegram.__get__(self)
-        self._log_circuit = _log_circuit.__get__(self)
-
-        # ---- Telegram Rate Limiter (v1.4.6) ----
         self.last_telegram_send = 0.0
-        self.telegram_min_interval = 1.0  # seconds
+        self.last_check = self.last_successful_check = 0
+        self.last_error = None
+        self.queue_counts = {}
+        self.channel_status = {}
+
+    def _state(self):
+        state = self.state_manager.load()
+        schema = state.get('schema_version', STATE_SCHEMA_VERSION)
+        if schema not in (2, STATE_SCHEMA_VERSION):
+            raise ValueError('unsupported_state_schema')
+        state['schema_version'] = STATE_SCHEMA_VERSION
+        state.setdefault('baseline_initialized', False)
+        for key in ('videos', 'live_streams', 'sent_events', 'outbox', 'channel_baselines'):
+            state.setdefault(key, {})
+            if not isinstance(state[key], dict): raise ValueError('invalid_state_structure')
+        state.setdefault('history', [])
+        for job in state['outbox'].values():
+            if job['status'] == 'sending':
+                job['status'] = 'uncertain'
+                job['error'] = 'interrupted_delivery'
+        self.last_successful_check = state.get('last_successful_check', 0)
+        self.last_event_sent = state.get('last_event_sent', 0)
+        return state
+
+    def _save(self, state):
+        self.state_manager.save(state)
+        self.queue_counts = {s: sum(j['status'] == s for j in state['outbox'].values())
+                             for s in ('queued', 'uncertain', 'failed')}
+        self.safe_mode_active = bool(self.queue_counts['uncertain'] or self.queue_counts['failed'])
+
+    @staticmethod
+    def _mark(state, job):
+        table, flag = FLAGS[job['type']]
+        key = job['video_id'] if table == 'videos' else job['channel_id'] + '|' + job['video_id']
+        state[table].setdefault(key, {})[flag] = True
+        if job['type'] in ('live', 'ended'):
+            state['videos'].setdefault(job['video_id'], {})['was_live'] = True
 
     async def _safe_send(self, context, chat_id, text, video_url, thumbnail_url=None):
-        max_attempts = 5
-        base_delay = 1.0
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                now_send = time.time()
-                elapsed = now_send - self.last_telegram_send
-                if elapsed < self.telegram_min_interval:
-                    await asyncio.sleep(self.telegram_min_interval - elapsed)
-
-                reply_markup = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Смотреть на YouTube", url=video_url)]]
-                )
-                if thumbnail_url:
-                    try:
-                        await context.bot.send_photo(
-                            chat_id=str(chat_id),
-                            photo=thumbnail_url,
-                            caption=text,
-                            reply_markup=reply_markup,
-                        )
-                    except BadRequest as exc:
-                        self._log_telegram(
-                            logging.WARNING,
-                            f"type=thumbnail_fallback | error={exc}",
-                        )
-                        await context.bot.send_message(
-                            chat_id=str(chat_id),
-                            text=text,
-                            reply_markup=reply_markup,
-                        )
-                else:
-                    await context.bot.send_message(
-                        chat_id=str(chat_id),
-                        text=text,
-                        reply_markup=reply_markup,
-                    )
-
-                self.last_telegram_send = time.time()
-                return True
-
-            except RetryAfter as e:
-                wait_time = int(getattr(e, "retry_after", 5))
-                self._log_telegram(
-                    logging.WARNING,
-                    f"type=telegram_rate_limit | retry_after={wait_time}s"
-                )
-                await asyncio.sleep(wait_time)
-
-            except (TimedOut, NetworkError) as e:
-                jitter = random.uniform(0, 1)
-                delay = base_delay * (2 ** attempt) + jitter
-                self._log_telegram(
-                    logging.WARNING,
-                    f"type=telegram_network_error | attempt={attempt} | delay={round(delay,2)}"
-                )
-                await asyncio.sleep(delay)
-
-            except Exception as e:
-                jitter = random.uniform(0, 1)
-                delay = base_delay * (2 ** attempt) + jitter
-                self._log_telegram(
-                    logging.ERROR,
-                    f"type=telegram_error | attempt={attempt} | error={e}"
-                )
-                await asyncio.sleep(delay)
-
-        self._log_telegram(logging.CRITICAL, "type=telegram_failed_after_retries")
-        return False
-
-    async def run(self, context: ContextTypes.DEFAULT_TYPE):
-
-        async with self.run_lock:
-            return await asyncio.wait_for(
-                self._run_internal(context),
-                timeout=60
-            )
-
-    async def _run_internal(self, context: ContextTypes.DEFAULT_TYPE):
-
-        run_start = time.time()
-        events_sent_this_run = 0
-        telegram_failures_this_run = 0
-        self.safe_mode_active = False
-
-        state = self.state_manager.load()
-
-        # ---- STATE INIT ----
-        if state.get("schema_version") != STATE_SCHEMA_VERSION:
-            self._log_system(
-                logging.WARNING,
-                f"state_migrate | {state.get('schema_version')} -> {STATE_SCHEMA_VERSION}"
-            )
-            state.pop("state_version", None)
-            state["schema_version"] = STATE_SCHEMA_VERSION
-
-        state.setdefault("baseline_initialized", False)
-        state.setdefault("videos", {})
-        state.setdefault("live_streams", {})
-        state.setdefault("sent_events", {})
-        state.setdefault("disabled_channels", {})
-
-        # ---- TTL CLEANUP ----
-        now_ts = int(time.time())
-        expired = [
-            k for k, v in state["sent_events"].items()
-            if not isinstance(v, int) or now_ts - v > EVENT_TTL
-        ]
-        for k in expired:
-            del state["sent_events"][k]
-
-        # ---- BASELINE INIT ----
-        if BASELINE_MODE and not state.get("baseline_initialized"):
-            baseline_success = True
-            for channel_id in YOUTUBE_CHANNEL_IDS:
+        await asyncio.sleep(max(0, 1 - (time.time() - self.last_telegram_send)))
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton('Смотреть на YouTube', url=video_url)]])
+        try:
+            if thumbnail_url:
                 try:
-                    entries = await asyncio.wait_for(
-                        asyncio.to_thread(self.youtube.fetch, channel_id, MAX_FEED_ITEMS),
-                        timeout=15
-                    )
-                except Exception as e:
-                    baseline_success = False
-                    self._log_youtube(
-                        logging.ERROR,
-                        f"baseline_fetch_error | {channel_id} | {e}"
-                    )
-                    entries = []
-
-                if not entries:
-                    continue
-
-                for entry in entries:
-                    vid = entry.get("video_id")
-                    if not vid:
-                        continue
-
-                    status = entry.get("event_status", "video")
-                    was_live = status in ("live", "ended")
-
-                    state["videos"].setdefault(
-                        vid, {"published": True, "was_live": was_live}
-                    )
-
-                    live_key = f"{channel_id}|{vid}"
-                    state["live_streams"].setdefault(
-                        live_key,
-                        {
-                            "scheduled": status in ("upcoming", "live", "ended"),
-                            "live": status in ("live", "ended"),
-                            "ended": status == "ended",
-                        },
-                    )
-
-            if not baseline_success:
-                self._log_system(logging.WARNING, "baseline_incomplete")
-                self.state_manager.save(state)
-                return
-
-            state["baseline_initialized"] = True
-            self.state_manager.save(state)
-            self._log_system(logging.INFO, "baseline_initialized")
-            return
-
-        # ---- MAIN LOOP ----
-        for channel_id in YOUTUBE_CHANNEL_IDS:
-
-            now = int(time.time())
-
-            # Circuit breaker check
-            if channel_id in self.channel_disabled_until:
-                if now < self.channel_disabled_until[channel_id]:
-                    continue
-                else:
-                    del self.channel_disabled_until[channel_id]
-                    self.channel_failures[channel_id] = 0
-                    self._log_circuit(
-                        logging.INFO,
-                        f"recovered | {channel_id}"
-                    )
-
-            try:
-                entries = await asyncio.wait_for(
-                    asyncio.to_thread(self.youtube.fetch, channel_id, MAX_FEED_ITEMS),
-                    timeout=15
-                )
-            except Exception as e:
-                self._log_youtube(
-                    logging.ERROR,
-                    f"fetch_timeout_or_error | {channel_id} | {e}"
-                )
-                self.youtube_failures_total += 1
-                entries = []
-
-            if not isinstance(entries, list):
-                self._log_youtube(
-                    logging.ERROR,
-                    f"invalid_feed_type | {channel_id} | {type(entries)}"
-                )
-                entries = []
-
-            if not entries:
-                fails = self.channel_failures.get(channel_id, 0) + 1
-                self.channel_failures[channel_id] = fails
-
-                if fails >= self.breaker_threshold:
-                    self.channel_disabled_until[channel_id] = now + self.breaker_timeout
-                    self.circuit_breaker_triggers += 1
-                    self._log_circuit(
-                        logging.WARNING,
-                        f"type=circuit_breaker_triggered | channel={channel_id} | timeout={self.breaker_timeout}"
-                    )
-                continue
+                    message = await context.bot.send_photo(chat_id=str(chat_id), photo=thumbnail_url,
+                                                           caption=text, reply_markup=markup)
+                except BadRequest:
+                    # A definite rejection of the photo permits one text fallback.
+                    message = await context.bot.send_message(chat_id=str(chat_id), text=text, reply_markup=markup)
             else:
-                self.channel_failures[channel_id] = 0
+                message = await context.bot.send_message(chat_id=str(chat_id), text=text, reply_markup=markup)
+            self.last_telegram_send = time.time()
+            return message.message_id
+        except RetryAfter:
+            raise
+        except (TimedOut, NetworkError):
+            # Telegram may have accepted the request. Never automatically repeat it.
+            raise DeliveryUncertain('telegram_response_unknown') from None
+        except (BadRequest, Forbidden):
+            raise DeliveryRejected('telegram_rejected') from None
 
-            entries.sort(
-                key=lambda e: e.get("published_timestamp", 0)
-            )
+    async def run(self, context):
+        async with self.run_lock:
+            started = time.time()
+            self.last_check = started
+            try:
+                await asyncio.wait_for(self._run_internal(context), timeout=120)
+            except asyncio.CancelledError:
+                self.last_error = 'interrupted'; raise
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                logger.error('monitor_check_failed type=%s', self.last_error)
+            finally:
+                self.last_run_duration = time.time() - started
+                self.check_duration_total += self.last_run_duration
+                self.check_run_count += 1
 
-            entries = entries[-MAX_FEED_ITEMS:]
-
-            for entry in entries:
-                video_id = entry.get("video_id")
-                if not video_id:
-                    continue
-
-                broadcast = entry.get("event_status", "video")
-
-                video_state = state["videos"].setdefault(
-                    video_id, {"published": False, "was_live": False}
-                )
-
-                live_key = f"{channel_id}|{video_id}"
-                live_state = state["live_streams"].setdefault(
-                    live_key,
-                    {"scheduled": False, "live": False, "ended": False},
-                )
-
-                event_type = None
-
-                if broadcast == "upcoming" and not live_state["scheduled"]:
-                    event_type = "scheduled"
-                    live_state["scheduled"] = True
-
-                elif broadcast == "live" and not live_state["live"]:
-                    event_type = "live"
-                    live_state["live"] = True
-                    video_state["was_live"] = True
-
-                elif broadcast == "ended":
-                    video_state["was_live"] = True
-                    if not live_state["ended"]:
-                        event_type = "ended"
-                        live_state["ended"] = True
-
-                elif broadcast == "video":
-                    if not video_state["published"]:
-                        event_type = "video"
-                        video_state["published"] = True
-
-                if not event_type:
-                    continue
-
-                event_key = f"{channel_id}|{video_id}|{event_type}"
-                if event_key in state["sent_events"]:
-                    continue
-
-                if events_sent_this_run >= MAX_EVENTS_PER_RUN:
-                    self.state_manager.save(state)
-                    return
-
-                if not SILENT_MODE:
-                    chat_id = TG_CHANNELS.get(channel_id)
-                    if not chat_id:
-                        self._log_telegram(
-                            logging.ERROR,
-                            f"tg_channel_missing | {channel_id}"
-                        )
-                        continue
-                    else:
-                        event_labels = {
-                            "video": "Новое видео",
-                            "scheduled": "Запланирован стрим",
-                            "live": "Стрим начался",
-                            "ended": "Стрим завершён",
-                        }
-                        text = f"{event_labels[event_type]}\n\n{entry.get('title', '')}"
-
-                        success = await self._safe_send(
-                            context,
-                            chat_id,
-                            text,
-                            entry.get("url", ""),
-                            entry.get("thumbnail_url"),
-                        )
-                        if not success:
-                            telegram_failures_this_run += 1
-                            self.telegram_failures_total += 1
-                            if telegram_failures_this_run >= 3:
-                                self.safe_mode_active = True
-                                self._log_system(
-                                    logging.ERROR,
-                                    "telegram_safe_mode_triggered"
-                                )
-                                self.state_manager.save(state)
-                                return
-                            continue
-
-                self.last_event_sent = int(time.time())
-                state["sent_events"][event_key] = self.last_event_sent
+    async def _deliver(self, context, state, budget=MAX_EVENTS_PER_RUN):
+        count = 0
+        for key, job in list(state['outbox'].items()):
+            if count >= budget: break
+            if job['status'] != 'queued' or job.get('next_attempt', 0) > time.time(): continue
+            if SILENT_MODE: continue  # Pending events remain queued while paused.
+            chat = TG_CHANNELS.get(job['channel_id'])
+            if not chat:
+                job.update(status='failed', error='destination_missing'); self._save(state); continue
+            job['status'] = 'sending'; job['attempts'] = job.get('attempts', 0) + 1
+            self._save(state)  # Durable before the network request.
+            count += 1
+            try:
+                message_id = await self._safe_send(context, chat, job['text'], job['url'], job.get('thumbnail_url'))
+            except RetryAfter as exc:
+                delay = exc.retry_after
+                if hasattr(delay, 'total_seconds'): delay = delay.total_seconds()
+                job.update(status='queued', next_attempt=time.time() + float(delay) + 1, error='rate_limit')
+                self.telegram_failures_total += 1
+            except DeliveryRejected:
+                job.update(status='failed', error='telegram_rejected'); self.telegram_failures_total += 1
+            except BaseException as exc:
+                job.update(status='uncertain', error='telegram_response_unknown')
+                self.telegram_failures_total += 1
+                self._save(state)
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)): raise
+            else:
+                self._mark(state, job)
+                now = int(time.time())
+                state['sent_events'][key] = now
+                state['last_event_sent'] = self.last_event_sent = now
+                state['history'] = (state['history'] + [{'event': key, 'message_id': message_id, 'sent_at': now}])[-500:]
+                del state['outbox'][key]
                 self.events_sent_total += 1
-                events_sent_this_run += 1
+            self._save(state)
 
-        # Auto recovery from safe mode
-        if self.safe_mode_active and telegram_failures_this_run == 0:
-            self.safe_mode_active = False
-            self._log_system(logging.INFO, "telegram_safe_mode_recovered")
+        return count
 
-        duration = time.time() - run_start
-        self.last_run_duration = duration
-        self.check_duration_total += duration
-        self.check_run_count += 1
-
-        self._log_system(
-            logging.INFO,
-            f"run_complete | events={events_sent_this_run} | "
-            f"duration={round(duration,2)}s | "
-            f"safe_mode={self.safe_mode_active}"
-        )
-        self.state_manager.save(state)
+    async def _run_internal(self, context):
+        state = self._state(); self._save(state)
+        # Deliver persisted events even if YouTube is temporarily unavailable.
+        used = await self._deliver(context, state)
+        success = True
+        for channel in YOUTUBE_CHANNEL_IDS:
+            try:
+                entries = await asyncio.wait_for(asyncio.to_thread(self.youtube.fetch, channel, MAX_FEED_ITEMS), timeout=50)
+                if not isinstance(entries, list): raise ValueError('invalid_feed')
+            except Exception as exc:
+                success = False; self.youtube_failures_total += 1
+                self.channel_status[channel] = {'ok': False, 'error': type(exc).__name__}
+                logger.error('youtube_check_failed type=%s', type(exc).__name__)
+                continue
+            self.channel_status[channel] = {'ok': True, 'checked_at': int(time.time()), 'items': len(entries)}
+            baseline = BASELINE_MODE and not state['baseline_initialized'] and not state['channel_baselines'].get(channel)
+            for entry in sorted(entries, key=lambda x: x.get('published_timestamp', 0)):
+                vid = entry.get('video_id')
+                if not vid: continue
+                status = entry.get('event_status', 'video')
+                event = 'scheduled' if status == 'upcoming' else status
+                if event not in FLAGS: continue
+                job = {'channel_id': channel, 'video_id': vid, 'type': event}
+                key = channel + '|' + vid + '|' + event
+                if baseline:
+                    for kind in ({'scheduled', 'live', 'ended'} if event == 'ended' else {'scheduled', 'live'} if event == 'live' else {event}):
+                        self._mark(state, {**job, 'type': kind})
+                    continue
+                table, flag = FLAGS[event]
+                legacy_key = vid if table == 'videos' else channel + '|' + vid
+                if state[table].get(legacy_key, {}).get(flag) or key in state['sent_events'] or key in state['outbox']: continue
+                state['outbox'][key] = {**job, 'status': 'queued', 'created': int(time.time()), 'attempts': 0,
+                                       'text': LABELS[event] + '\n\n' + entry.get('title', ''),
+                                       'url': entry.get('url', ''), 'thumbnail_url': entry.get('thumbnail_url')}
+            if baseline: state['channel_baselines'][channel] = True
+            self._save(state)
+        if success:
+            state['baseline_initialized'] = True
+            state['last_successful_check'] = self.last_successful_check = int(time.time())
+            self.last_error = None
+        else: self.last_error = 'youtube_check_failed'
+        self._save(state)
+        await self._deliver(context, state, MAX_EVENTS_PER_RUN - used)
+        logger.info('run_complete queue=%s monitoring_ok=%s', self.queue_counts, success)
