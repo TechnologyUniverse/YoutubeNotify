@@ -1,6 +1,7 @@
 import json
 import logging
 import random
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -111,53 +112,7 @@ class YouTubeAPIClient:
                 self.consecutive_failures = 0
                 return []
 
-            videos = self._request(
-                "videos",
-                {
-                    "part": "snippet,liveStreamingDetails",
-                    "id": ",".join(video_ids),
-                    "maxResults": len(video_ids),
-                },
-            )
-
-            result = []
-            for item in videos.get("items", []):
-                snippet = item.get("snippet", {})
-                live_details = item.get("liveStreamingDetails", {})
-                broadcast = snippet.get("liveBroadcastContent", "none")
-                if live_details.get("actualEndTime"):
-                    event_status = "ended"
-                elif broadcast == "live":
-                    event_status = "live"
-                elif broadcast == "upcoming":
-                    event_status = "upcoming"
-                else:
-                    event_status = "video"
-
-                video_id = item.get("id")
-                if not video_id:
-                    continue
-                published_at = snippet.get("publishedAt")
-                thumbnails = snippet.get("thumbnails", {})
-                thumbnail_url = next(
-                    (
-                        thumbnails[size].get("url")
-                        for size in ("maxres", "standard", "high", "medium", "default")
-                        if thumbnails.get(size, {}).get("url")
-                    ),
-                    None,
-                )
-                result.append(
-                    {
-                        "video_id": video_id,
-                        "title": snippet.get("title", ""),
-                        "url": f"https://www.youtube.com/watch?v={video_id}",
-                        "published_at": published_at,
-                        "published_timestamp": self._timestamp(published_at),
-                        "event_status": event_status,
-                        "thumbnail_url": thumbnail_url,
-                    }
-                )
+            result = self.fetch_ids(video_ids)
 
             self.last_success = int(time.time())
             self.consecutive_failures = 0
@@ -172,3 +127,66 @@ class YouTubeAPIClient:
             self.total_failures += 1
             logger.exception("type=youtube_api_fetch_failed | channel=%s", channel_id)
             raise
+
+    def fetch_ids(self, video_ids: list[str]) -> list[dict]:
+        """Refresh known premieres without changing normal channel discovery."""
+        videos = self._request(
+            "videos",
+            {
+                "part": "snippet,contentDetails,status,liveStreamingDetails",
+                "id": ",".join(video_ids),
+                "maxResults": len(video_ids),
+            },
+        )
+
+        result = []
+        for item in videos.get("items", []):
+            snippet = item.get("snippet", {})
+            live_details = item.get("liveStreamingDetails") or {}
+            broadcast = snippet.get("liveBroadcastContent", "none")
+            if live_details.get("actualEndTime"):
+                event_status = "ended"
+            elif broadcast == "live":
+                event_status = "live"
+            elif broadcast == "upcoming":
+                event_status = "upcoming"
+            else:
+                event_status = "video"
+
+            # A processed, pre-recorded upload has a fixed duration before it
+            # starts. Encoder broadcasts remain uploaded/zero-duration while
+            # upcoming/live. Never infer a premiere from an ended archive.
+            duration = item.get("contentDetails", {}).get("duration", "")
+            fixed_duration = any(float(n) > 0 for n in re.findall(r"\d+(?:\.\d+)?", duration))
+            is_premiere = (broadcast in ("upcoming", "live")
+                           and not live_details.get("actualEndTime")
+                           and item.get("status", {}).get("uploadStatus") == "processed"
+                           and fixed_duration)
+            video_id = item.get("id")
+            if not video_id:
+                continue
+            published_at = snippet.get("publishedAt")
+            thumbnails = snippet.get("thumbnails", {})
+            thumbnail_url = next(
+                (
+                    thumbnails[size].get("url")
+                    for size in ("maxres", "standard", "high", "medium", "default")
+                    if thumbnails.get(size, {}).get("url")
+                ),
+                None,
+            )
+            result.append(
+                {
+                    "video_id": video_id,
+                    "title": snippet.get("title", ""),
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "published_at": published_at,
+                    "published_timestamp": self._timestamp(published_at),
+                    "event_status": event_status,
+                    "is_premiere": is_premiere,
+                    "scheduled_timestamp": self._timestamp(live_details.get("scheduledStartTime")),
+                    "thumbnail_url": thumbnail_url,
+                }
+            )
+
+        return result

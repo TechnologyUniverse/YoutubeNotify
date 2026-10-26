@@ -40,7 +40,7 @@ class Engine:
             raise ValueError('unsupported_state_schema')
         state['schema_version'] = STATE_SCHEMA_VERSION
         state.setdefault('baseline_initialized', False)
-        for key in ('videos', 'live_streams', 'sent_events', 'outbox', 'channel_baselines'):
+        for key in ('videos', 'live_streams', 'sent_events', 'outbox', 'channel_baselines', 'premieres'):
             state.setdefault(key, {})
             if not isinstance(state[key], dict): raise ValueError('invalid_state_structure')
         state.setdefault('history', [])
@@ -105,9 +105,10 @@ class Engine:
                 self.check_duration_total += self.last_run_duration
                 self.check_run_count += 1
 
-    async def _deliver(self, context, state, budget=MAX_EVENTS_PER_RUN):
+    async def _deliver(self, context, state, budget=MAX_EVENTS_PER_RUN, only_keys=None):
         count = 0
         for key, job in list(state['outbox'].items()):
+            if only_keys is not None and key not in only_keys: continue
             if count >= budget: break
             if job['status'] != 'queued' or job.get('next_attempt', 0) > time.time(): continue
             if SILENT_MODE: continue  # Pending events remain queued while paused.
@@ -143,14 +144,35 @@ class Engine:
 
         return count
 
-    async def _run_internal(self, context):
-        state = self._state(); self._save(state)
-        # Deliver persisted events even if YouTube is temporarily unavailable.
-        used = await self._deliver(context, state)
-        success = True
-        for channel in YOUTUBE_CHANNEL_IDS:
+    async def run_premieres(self, context):
+        async with self.run_lock:
             try:
-                entries = await asyncio.wait_for(asyncio.to_thread(self.youtube.fetch, channel, MAX_FEED_ITEMS), timeout=50)
+                await asyncio.wait_for(self._run_internal(context, premiere_only=True), timeout=60)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error('premiere_check_failed type=%s', type(exc).__name__)
+
+    async def _run_internal(self, context, premiere_only=False):
+        state = self._state()
+        watched = [p for vid, p in state['premieres'].items()
+                   if not state['videos'].get(vid, {}).get('published')
+                   and p.get('scheduled_timestamp', 0) <= time.time() + 60]
+        if premiere_only and not watched: return
+        only_keys = ({p['channel_id'] + '|' + p['video_id'] + '|video' for p in watched}
+                     if premiere_only else None)
+        self._save(state)
+        # Deliver persisted events even if YouTube is temporarily unavailable.
+        used = await self._deliver(context, state, only_keys=only_keys)
+        success = True
+        channels = sorted({p['channel_id'] for p in watched}) if premiere_only else YOUTUBE_CHANNEL_IDS
+        for channel in channels:
+            try:
+                if premiere_only:
+                    ids = [p['video_id'] for p in watched if p['channel_id'] == channel]
+                    entries = await asyncio.wait_for(asyncio.to_thread(self.youtube.fetch_ids, ids), timeout=50)
+                else:
+                    entries = await asyncio.wait_for(asyncio.to_thread(self.youtube.fetch, channel, MAX_FEED_ITEMS), timeout=50)
                 if not isinstance(entries, list): raise ValueError('invalid_feed')
             except Exception as exc:
                 success = False; self.youtube_failures_total += 1
@@ -158,12 +180,27 @@ class Engine:
                 logger.error('youtube_check_failed type=%s', type(exc).__name__)
                 continue
             self.channel_status[channel] = {'ok': True, 'checked_at': int(time.time()), 'items': len(entries)}
-            baseline = BASELINE_MODE and not state['baseline_initialized'] and not state['channel_baselines'].get(channel)
+            baseline = not premiere_only and BASELINE_MODE and not state['baseline_initialized'] and not state['channel_baselines'].get(channel)
             for entry in sorted(entries, key=lambda x: x.get('published_timestamp', 0)):
                 vid = entry.get('video_id')
                 if not vid: continue
                 status = entry.get('event_status', 'video')
-                event = 'scheduled' if status == 'upcoming' else status
+                if entry.get('is_premiere') or vid in state['premieres']:
+                    state['premieres'][vid] = {
+                        'channel_id': channel, 'video_id': vid,
+                        'scheduled_timestamp': entry.get('scheduled_timestamp', 0),
+                    }
+                    # Cancel only definitely unsent legacy stream jobs for this premiere.
+                    # Sent history and ambiguous deliveries are never rewritten/retried.
+                    for stream_event in ('scheduled', 'live', 'ended'):
+                        old_key = channel + '|' + vid + '|' + stream_event
+                        if state['outbox'].get(old_key, {}).get('status') == 'queued':
+                            del state['outbox'][old_key]
+                    if status == 'upcoming':
+                        continue  # Not published: keep watching, do not mark it sent.
+                    event = 'video'
+                else:
+                    event = 'scheduled' if status == 'upcoming' else status
                 if event not in FLAGS: continue
                 job = {'channel_id': channel, 'video_id': vid, 'type': event}
                 key = channel + '|' + vid + '|' + event
@@ -179,11 +216,11 @@ class Engine:
                                        'url': entry.get('url', ''), 'thumbnail_url': entry.get('thumbnail_url')}
             if baseline: state['channel_baselines'][channel] = True
             self._save(state)
-        if success:
+        if success and not premiere_only:
             state['baseline_initialized'] = True
             state['last_successful_check'] = self.last_successful_check = int(time.time())
             self.last_error = None
-        else: self.last_error = 'youtube_check_failed'
+        elif not premiere_only: self.last_error = 'youtube_check_failed'
         self._save(state)
-        await self._deliver(context, state, MAX_EVENTS_PER_RUN - used)
+        await self._deliver(context, state, MAX_EVENTS_PER_RUN - used, only_keys=only_keys)
         logger.info('run_complete queue=%s monitoring_ok=%s', self.queue_counts, success)

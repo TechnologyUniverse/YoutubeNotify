@@ -1,3 +1,12 @@
+# 2.0.2 — 2026-10-26
+
+- Recognize active/upcoming pre-recorded Premieres from processed upload status and fixed non-zero duration; never reinterpret ended archives from those fields alone.
+- Track recognized Premieres durably across restarts. Suppress scheduled/live/ended stream messages for those videos and enqueue the existing "Новое видео" event after an actual transition out of upcoming.
+- Refresh known, unpublished Premieres every 30 seconds near their scheduled start, using video IDs only. Normal discovery, stream notifications, and ordinary upload checks keep their existing 30-minute interval.
+- Preserve confirmed history, baseline and delivery ambiguity protections. No messages are replayed from historical Premieres.
+
+Timing depends on YouTube API status updates, the polling interval, and Telegram availability. New Premieres must first be discovered by the normal channel check. YouTube Data API has no explicit Premiere field; unprocessed/missing-duration metadata cannot be positively classified until available.
+
 # 2.0.1 — 2026-10-14
 
 - Persist an outbox before delivery and commit processed flags only after Telegram confirms a message.

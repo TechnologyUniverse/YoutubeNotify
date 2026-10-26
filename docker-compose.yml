@@ -1,7 +1,7 @@
 name: youtubenotify
 services:
   youtubenotify:
-    image: youtubenotify:2.0.1
+    image: youtubenotify:2.0.2
     container_name: youtubenotify
     user: "10002:10002"
     init: true

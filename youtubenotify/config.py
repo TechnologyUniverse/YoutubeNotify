@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 STATE_SCHEMA_VERSION = 3
 
 APP_START_TIME = None  # will be set in main at runtime

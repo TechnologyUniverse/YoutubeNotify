@@ -1,0 +1,2 @@
+FROM youtubenotify:2.0.1
+COPY youtubenotify /app/youtubenotify

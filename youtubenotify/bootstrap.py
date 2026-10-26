@@ -51,6 +51,11 @@ def create_app():
             first=10,
             name="check_updates",
         )
+        # Check only known premieres near their planned start. Other event
+        # discovery and delivery retain their existing 30-minute schedule.
+        app.job_queue.run_repeating(
+            engine.run_premieres, interval=30, first=20, name="check_premieres",
+        )
 
     # Separate loopback HTTP listener works in polling and webhook modes.
     from aiohttp import web
@@ -59,7 +64,7 @@ def create_app():
         healthy = (app.running and bool(app.updater and app.updater.running)
                    and age is not None and age < 3900 and not engine.last_error)
         return web.json_response({"status": "ok" if healthy else "degraded",
-                                  "version": "2.0.1", "last_successful_check": engine.last_successful_check,
+                                  "version": "2.0.2", "last_successful_check": engine.last_successful_check,
                                   "monitor_age_seconds": int(age) if age is not None else None,
                                   "queue": engine.queue_counts, "last_error": engine.last_error,
                                   "safe_mode": engine.safe_mode_active}, status=200 if healthy else 503)
